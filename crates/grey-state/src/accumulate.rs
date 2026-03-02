@@ -3,6 +3,7 @@
 //! Manages the work-report accumulation queue, dependency resolution,
 //! and PVM execution of service Accumulate code (ΨA).
 
+use crate::pvm_backend::{ExitReason, PvmInstance};
 use grey_types::config::Config;
 use grey_types::work::{WorkReport, WorkResult};
 use grey_types::{Gas, Hash, ServiceId, Timeslot};
@@ -525,50 +526,49 @@ fn run_accumulate_pvm(
     fetch_ctx: &FetchContext,
 ) -> (AccContext, Gas) {
     // Initialize PVM
+    let mut hc_count = 0u32;
     eprintln!("[pvm_init] code_blob len={} args len={} gas={gas}", code_blob.len(), args.len());
-    eprintln!("[pvm_init] code_blob[0..16]={:?}", &code_blob[..16.min(code_blob.len())]);
-    let pvm = grey_pvm::program::initialize_program(code_blob, args, gas);
-    let mut pvm = match pvm {
+    let mut pvm = match PvmInstance::initialize(code_blob, args, gas) {
         Some(p) => {
-            eprintln!("[pvm_init] OK, pc={} code_len={} bitmask_len={}", p.pc, p.code.len(), p.bitmask.len());
-            // Dump first 16 bytes of code and bitmask for debugging
-            let show = 16.min(p.code.len());
-            eprintln!("[pvm_init] code[0..{show}]={:?}", &p.code[..show]);
-            eprintln!("[pvm_init] mask[0..{show}]={:?}", &p.bitmask[..show]);
+            eprintln!("[pvm_init] OK, pc={}", p.pc());
             p
         }
         None => {
-            eprintln!("[pvm_init] FAILED - initialize_program returned None");
+            eprintln!("[pvm_init] FAILED - initialize returned None");
             return (exceptional, 0);
         }
     };
 
     // Set entry point: ΨM(c, 5, ...) starts at instruction counter 5 for accumulate
-    pvm.pc = 5;
+    pvm.set_pc(5);
 
-    let initial_gas = pvm.gas;
+    let initial_gas = pvm.gas();
 
     loop {
-        let (exit_reason, _) = pvm.run();
-        eprintln!("[pvm_run] exit={exit_reason:?} gas_remaining={} pc={}", pvm.gas, pvm.pc);
+        let exit_reason = pvm.run();
+        eprintln!("[pvm_run] exit={exit_reason:?} gas_remaining={} pc={}", pvm.gas(), pvm.pc());
         match exit_reason {
-            grey_pvm::ExitReason::Halt => {
-                let gas_used = initial_gas - pvm.gas;
+            ExitReason::Halt => {
+                let gas_used = initial_gas - pvm.gas();
                 eprintln!("[pvm_run] HALT gas_used={gas_used}");
                 return (regular, gas_used);
             }
-            grey_pvm::ExitReason::Panic | grey_pvm::ExitReason::OutOfGas => {
-                let gas_used = initial_gas - pvm.gas;
+            ExitReason::Panic | ExitReason::OutOfGas => {
+                let gas_used = initial_gas - pvm.gas();
                 eprintln!("[pvm_run] PANIC/OOG gas_used={gas_used}");
+                for r in 0..13 {
+                    eprintln!("  reg[{r}] = 0x{:016x}", pvm.reg(r));
+                }
                 return (exceptional, gas_used);
             }
-            grey_pvm::ExitReason::PageFault(addr) => {
-                let gas_used = initial_gas - pvm.gas;
+            ExitReason::PageFault(addr) => {
+                let gas_used = initial_gas - pvm.gas();
                 eprintln!("[pvm_run] PAGE_FAULT addr=0x{addr:08x} gas_used={gas_used}");
                 return (exceptional, gas_used);
             }
-            grey_pvm::ExitReason::HostCall(id) => {
-                eprintln!("[host_call] id={id} ALL regs={:?}", pvm.registers);
+            ExitReason::HostCall(id) => {
+                let gas_before_hc = pvm.gas();
+                let pc_at_hc = pvm.pc();
                 let ok = handle_host_call(
                     id,
                     &mut pvm,
@@ -578,11 +578,24 @@ fn run_accumulate_pvm(
                     entropy,
                     fetch_ctx,
                 );
+                let gas_after_hc = pvm.gas();
+                let hc_cost = gas_before_hc as i64 - gas_after_hc as i64;
+                let phi7 = pvm.reg(7);
+                eprintln!(
+                    "[host_call] id={id} pc={pc_at_hc} gas_before={gas_before_hc} gas_after={gas_after_hc} cost={hc_cost} ok={ok} φ7={phi7}"
+                );
+                // Debug: dump registers after first host call
+                if hc_count == 0 {
+                    hc_count += 1;
+                    eprintln!("[after_hc1] registers:");
+                    for r in 0..13 {
+                        eprintln!("  reg[{r}] = 0x{:016x}", pvm.reg(r));
+                    }
+                }
                 if !ok {
-                    let gas_used = initial_gas - pvm.gas;
+                    let gas_used = initial_gas - pvm.gas();
                     return (exceptional, gas_used);
                 }
-                // PC already advanced by PVM step function
             }
         }
     }
@@ -592,28 +605,36 @@ fn run_accumulate_pvm(
 /// Returns true to continue, false to abort.
 fn handle_host_call(
     id: u32,
-    pvm: &mut grey_pvm::Pvm,
+    pvm: &mut PvmInstance,
     regular: &mut AccContext,
     exceptional: &mut AccContext,
     timeslot: Timeslot,
     _entropy: &Hash,
     fetch_ctx: &FetchContext,
 ) -> bool {
-    // Host-call gas cost (GP Appendix B, eq B.15):
-    // All host calls cost g=10, except:
-    //   - log (id=100): g=0 (JIP-1, per accumulate test vector README)
-    //   - transfer (id=20): g=10+t (GP spec)
-    // Transfer gas is handled inside host_transfer (varies on success/failure)
+    // Host-call gas cost (GP Appendix B, eq B.15): ϱ′ ≡ ϱ − g
+    //
+    // Per the GP spec (A.36), when the PVM exits on ecalli the machine state
+    // is "prior to this instruction" — ecalli's instruction gas (1) is NOT
+    // applied.  The host-call gas g covers the full cost.
+    //
+    // With basic-block gas metering, ecalli's cost (1) is already charged as
+    // part of the block.  We therefore refund 1 gas so the net charge matches
+    // the spec: total = g (not 1 + g).
     let host_gas_cost: u64 = match id {
-        100 => 0,  // log: accumulate STF vectors use g=0 per their README
+        100 => 0,  // log: g=0 (JIP-1, per accumulate test vector README)
         20 => 10,  // transfer: base cost 10, gas_limit charged on success only
         _ => 10,
     };
 
-    if pvm.gas < host_gas_cost {
+    // Refund ecalli instruction cost (1) that was included in the block gas
+    // charge, since the spec says the exit state is prior to ecalli.
+    pvm.set_gas(pvm.gas() + 1);
+
+    if pvm.gas() < host_gas_cost {
         return false;
     }
-    pvm.gas -= host_gas_cost;
+    pvm.set_gas(pvm.gas() - host_gas_cost);
 
     match id {
         0 => host_gas(pvm, regular),
@@ -627,32 +648,34 @@ fn handle_host_call(
         25 => host_yield(pvm, regular),
         100 => {
             // log host call (JIP-1): always returns WHAT in φ'7
-            pvm.registers[7] = u64::MAX;
+            pvm.set_reg(7, u64::MAX);
             true
         }
         _ => {
             // Unknown host call: set WHAT in register 7
-            pvm.registers[7] = u64::MAX;
+            pvm.set_reg(7, u64::MAX);
             true
         }
     }
 }
 
 /// gas (id=0): Return remaining gas in φ[7].
-fn host_gas(pvm: &mut grey_pvm::Pvm, _ctx: &mut AccContext) -> bool {
-    pvm.registers[7] = pvm.gas;
+fn host_gas(pvm: &mut PvmInstance, _ctx: &mut AccContext) -> bool {
+    pvm.set_reg(7, pvm.gas());
     true
 }
 
 /// fetch (id=1): Read protocol/context data (ΩY).
 /// φ[7]=buffer_ptr, φ[8]=offset, φ[9]=max_len, φ[10]=mode, φ[11]=sub1, φ[12]=sub2
 /// Returns: φ'[7] = |v| (total data length) or NONE (u64::MAX).
-fn host_fetch(pvm: &mut grey_pvm::Pvm, fetch_ctx: &FetchContext) -> bool {
-    let buf_ptr = pvm.registers[7] as u32;
-    let offset = pvm.registers[8];
-    let max_len = pvm.registers[9];
-    let mode = pvm.registers[10];
-    let sub1 = pvm.registers[11] as usize;
+fn host_fetch(pvm: &mut PvmInstance, fetch_ctx: &FetchContext) -> bool {
+    let buf_ptr = pvm.reg(7) as u32;
+    let offset = pvm.reg(8);
+    let max_len = pvm.reg(9);
+    let mode = pvm.reg(10);
+    let sub1 = pvm.reg(11) as usize;
+
+    eprintln!("[fetch] mode={mode} offset={offset} max_len={max_len} sub1={sub1} buf_ptr=0x{buf_ptr:08x}");
 
     // Select data based on mode (accumulate context: modes 0, 1, 14, 15)
     let owned_data: Option<Vec<u8>>;
@@ -674,7 +697,7 @@ fn host_fetch(pvm: &mut grey_pvm::Pvm, fetch_ctx: &FetchContext) -> bool {
     let data = match data {
         Some(d) => d,
         None => {
-            pvm.registers[7] = u64::MAX; // NONE
+            pvm.set_reg(7, u64::MAX); // NONE
             return true;
         }
     };
@@ -686,13 +709,15 @@ fn host_fetch(pvm: &mut grey_pvm::Pvm, fetch_ctx: &FetchContext) -> bool {
     // Write data[f..f+l] to memory at buf_ptr
     if l > 0 {
         let src = &data[f as usize..(f + l) as usize];
-        for (i, &byte) in src.iter().enumerate() {
-            pvm.memory.write_u8(buf_ptr + i as u32, byte);
-        }
+        pvm.write_bytes(buf_ptr, src);
     }
 
     // Return total length of the data
-    pvm.registers[7] = data_len;
+    pvm.set_reg(7, data_len);
+    eprintln!("[fetch] mode={mode} data_len={data_len} wrote {} bytes at offset {f}", l);
+    if mode == 14 || mode == 15 {
+        eprintln!("[fetch] full_data[0..{}]={:02x?}", data.len(), data);
+    }
     true
 }
 
@@ -701,45 +726,38 @@ fn host_fetch(pvm: &mut grey_pvm::Pvm, fetch_ctx: &FetchContext) -> bool {
 /// φ[8] = key_ptr, φ[9] = key_len,
 /// φ[10] = output_ptr, φ[11] = output_max_len
 /// Returns: φ[7] = value_len or NONE
-fn host_read(pvm: &mut grey_pvm::Pvm, ctx: &mut AccContext) -> bool {
+fn host_read(pvm: &mut PvmInstance, ctx: &mut AccContext) -> bool {
     // GP eq B.14: s* = s if φ₇ = NONE, else φ₇
-    let service_id = if pvm.registers[7] == u64::MAX {
+    let service_id = if pvm.reg(7) == u64::MAX {
         ctx.service_id
-    } else if pvm.registers[7] <= u32::MAX as u64 {
-        pvm.registers[7] as ServiceId
+    } else if pvm.reg(7) <= u32::MAX as u64 {
+        pvm.reg(7) as ServiceId
     } else {
-        // Invalid service ID (> u32::MAX but not NONE) → won't match any service
-        pvm.registers[7] = u64::MAX; // NONE
+        pvm.set_reg(7, u64::MAX); // NONE
         return true;
     };
-    // GP: let [kO, kZ, o] = φ8...+3
-    let key_ptr = pvm.registers[8] as u32;
-    let key_len = pvm.registers[9] as u32;
-    let out_ptr = pvm.registers[10] as u32;
-    // GP: let f = min(φ11, |v|), let l = min(φ12, |v| - f)
-    let offset = pvm.registers[11];
-    let max_len = pvm.registers[12];
+    let key_ptr = pvm.reg(8) as u32;
+    let key_len = pvm.reg(9) as u32;
+    let out_ptr = pvm.reg(10) as u32;
+    let offset = pvm.reg(11);
+    let max_len = pvm.reg(12);
 
-    // Read key from memory
-    let mut key = vec![0u8; key_len as usize];
-    for (i, byte) in key.iter_mut().enumerate() {
-        *byte = pvm.memory.read_u8(key_ptr + i as u32).unwrap_or(0);
-    }
+    let key = pvm.read_bytes(key_ptr, key_len);
 
     if let Some(account) = ctx.accounts.get(&service_id) {
         if let Some(value) = account.storage.get(&key) {
             let v_len = value.len() as u64;
             let f = offset.min(v_len) as usize;
             let l = max_len.min(v_len - f as u64) as usize;
-            for i in 0..l {
-                pvm.memory.write_u8(out_ptr + i as u32, value[f + i]);
+            if l > 0 {
+                pvm.write_bytes(out_ptr, &value[f..f + l]);
             }
-            pvm.registers[7] = v_len; // return total value length
+            pvm.set_reg(7, v_len);
         } else {
-            pvm.registers[7] = u64::MAX; // NONE
+            pvm.set_reg(7, u64::MAX); // NONE
         }
     } else {
-        pvm.registers[7] = u64::MAX; // NONE
+        pvm.set_reg(7, u64::MAX); // NONE
     }
 
     true
@@ -748,46 +766,33 @@ fn host_read(pvm: &mut grey_pvm::Pvm, ctx: &mut AccContext) -> bool {
 /// write (id=4): Write to current service's storage.
 /// φ[7] = key_ptr, φ[8] = key_len, φ[9] = value_ptr, φ[10] = value_len
 /// Returns: φ[7] = OK(0) or error
-fn host_write(pvm: &mut grey_pvm::Pvm, ctx: &mut AccContext) -> bool {
+fn host_write(pvm: &mut PvmInstance, ctx: &mut AccContext) -> bool {
     const FULL: u64 = u64::MAX - 4;
 
-    let key_ptr = pvm.registers[7] as u32;
-    let key_len = pvm.registers[8] as u32;
-    let value_ptr = pvm.registers[9] as u32;
-    let value_len = pvm.registers[10] as u32;
+    let key_ptr = pvm.reg(7) as u32;
+    let key_len = pvm.reg(8) as u32;
+    let value_ptr = pvm.reg(9) as u32;
+    let value_len = pvm.reg(10) as u32;
 
-    // Read key from memory
-    let mut key = vec![0u8; key_len as usize];
-    for (i, byte) in key.iter_mut().enumerate() {
-        *byte = pvm.memory.read_u8(key_ptr + i as u32).unwrap_or(0);
-    }
-
-    // Read value from memory
-    let mut value = vec![0u8; value_len as usize];
-    for (i, byte) in value.iter_mut().enumerate() {
-        *byte = pvm.memory.read_u8(value_ptr + i as u32).unwrap_or(0);
-    }
+    let key = pvm.read_bytes(key_ptr, key_len);
+    let value = pvm.read_bytes(value_ptr, value_len);
 
     if let Some(account) = ctx.accounts.get_mut(&ctx.service_id) {
-        // GP: l = |ss[k]| if k ∈ K(ss), else NONE
         let old_len: u64 = account
             .storage
             .get(&key)
             .map(|v| v.len() as u64)
-            .unwrap_or(u64::MAX); // NONE
+            .unwrap_or(u64::MAX);
 
-        // GP eq 9.8: each storage entry (x,y) costs 34 + |x| + |y| octets
         let old_size: u64 = account
             .storage
             .get(&key)
             .map(|v| (34 + key.len() + v.len()) as u64)
             .unwrap_or(0);
 
-        // Compute hypothetical new state
         let new_bytes;
         let new_items;
         if value_len == 0 {
-            // Delete
             if account.storage.contains_key(&key) {
                 new_bytes = account.bytes.saturating_sub(old_size);
                 new_items = account.items.saturating_sub(1);
@@ -802,30 +807,26 @@ fn host_write(pvm: &mut grey_pvm::Pvm, ctx: &mut AccContext) -> bool {
             new_items = if was_new { account.items + 1 } else { account.items };
         }
 
-        // GP: threshold = items * BALANCE_PER_ITEM + bytes * BALANCE_PER_OCTET
         let threshold = new_items as u64 * grey_types::constants::BALANCE_PER_ITEM
             + new_bytes * grey_types::constants::BALANCE_PER_OCTET;
         if threshold > account.balance {
-            pvm.registers[7] = FULL;
+            pvm.set_reg(7, FULL);
             return true;
         }
 
-        // Apply the write
         if value_len == 0 {
             if account.storage.remove(&key).is_some() {
                 account.bytes = new_bytes;
                 account.items = new_items;
             }
         } else {
-            let was_new = !account.storage.contains_key(&key);
             account.storage.insert(key, value);
             account.bytes = new_bytes;
             account.items = new_items;
-            let _ = was_new; // already handled in new_items calculation
         }
-        pvm.registers[7] = old_len; // Return old value length or NONE
+        pvm.set_reg(7, old_len);
     } else {
-        pvm.registers[7] = u64::MAX; // NONE - service doesn't exist
+        pvm.set_reg(7, u64::MAX);
     }
 
     true
@@ -835,43 +836,28 @@ fn host_write(pvm: &mut grey_pvm::Pvm, ctx: &mut AccContext) -> bool {
 /// φ[7] = service_id (or if ≥ 2^32, defaults to current service s)
 /// φ[8] = output_ptr
 /// Returns φ[7] = OK(0) or error, writes info to memory
-fn host_info(pvm: &mut grey_pvm::Pvm, ctx: &mut AccContext) -> bool {
-    // GP eq B.13: s* = s if φ₇ = NONE, else φ₇
-    let service_id = if pvm.registers[7] == u64::MAX {
+fn host_info(pvm: &mut PvmInstance, ctx: &mut AccContext) -> bool {
+    let service_id = if pvm.reg(7) == u64::MAX {
         ctx.service_id
-    } else if pvm.registers[7] <= u32::MAX as u64 {
-        pvm.registers[7] as ServiceId
+    } else if pvm.reg(7) <= u32::MAX as u64 {
+        pvm.reg(7) as ServiceId
     } else {
-        // Invalid service ID → NONE
-        pvm.registers[7] = u64::MAX;
+        pvm.set_reg(7, u64::MAX);
         return true;
     };
-    let out_ptr = pvm.registers[8] as u32;
+    let out_ptr = pvm.reg(8) as u32;
 
     if let Some(account) = ctx.accounts.get(&service_id) {
-        // Write service info to memory
-        // code_hash (32 bytes)
-        for (i, b) in account.code_hash.0.iter().enumerate() {
-            pvm.memory.write_u8(out_ptr + i as u32, *b);
-        }
-        // balance (8 bytes LE)
-        let balance_bytes = account.balance.to_le_bytes();
-        for (i, b) in balance_bytes.iter().enumerate() {
-            pvm.memory.write_u8(out_ptr + 32 + i as u32, *b);
-        }
-        // min_item_gas (8 bytes LE)
-        let gas_bytes = account.min_item_gas.to_le_bytes();
-        for (i, b) in gas_bytes.iter().enumerate() {
-            pvm.memory.write_u8(out_ptr + 40 + i as u32, *b);
-        }
-        // min_memo_gas (8 bytes LE)
-        let memo_bytes = account.min_memo_gas.to_le_bytes();
-        for (i, b) in memo_bytes.iter().enumerate() {
-            pvm.memory.write_u8(out_ptr + 48 + i as u32, *b);
-        }
-        pvm.registers[7] = 0; // OK
+        // code_hash (32 bytes) + balance (8) + min_item_gas (8) + min_memo_gas (8)
+        let mut buf = [0u8; 56];
+        buf[..32].copy_from_slice(&account.code_hash.0);
+        buf[32..40].copy_from_slice(&account.balance.to_le_bytes());
+        buf[40..48].copy_from_slice(&account.min_item_gas.to_le_bytes());
+        buf[48..56].copy_from_slice(&account.min_memo_gas.to_le_bytes());
+        pvm.write_bytes(out_ptr, &buf);
+        pvm.set_reg(7, 0); // OK
     } else {
-        pvm.registers[7] = u64::MAX; // NONE
+        pvm.set_reg(7, u64::MAX); // NONE
     }
 
     true
@@ -879,12 +865,12 @@ fn host_info(pvm: &mut grey_pvm::Pvm, ctx: &mut AccContext) -> bool {
 
 /// checkpoint (id=17): Save rollback point. y ← x.
 fn host_checkpoint(
-    pvm: &mut grey_pvm::Pvm,
+    pvm: &mut PvmInstance,
     regular: &mut AccContext,
     exceptional: &mut AccContext,
 ) -> bool {
     *exceptional = regular.clone();
-    pvm.registers[7] = pvm.gas;
+    pvm.set_reg(7, pvm.gas());
     true
 }
 
@@ -892,54 +878,44 @@ fn host_checkpoint(
 /// φ[7] = dest, φ[8] = amount, φ[9] = gas_limit, φ[10] = memo_ptr
 /// Memo is always exactly W_T (128) bytes read from memory at φ[10].
 /// Returns: OK, WHO (dest unknown), LOW (gas < min), CASH (insufficient balance)
-fn host_transfer(pvm: &mut grey_pvm::Pvm, ctx: &mut AccContext) -> bool {
-    const MEMO_SIZE: usize = 128; // W_T
-    const WHO: u64 = u64::MAX - 3;  // destination not found
-    const LOW: u64 = u64::MAX - 7;  // gas below minimum
-    const CASH: u64 = u64::MAX - 6; // insufficient balance
+fn host_transfer(pvm: &mut PvmInstance, ctx: &mut AccContext) -> bool {
+    const MEMO_SIZE: u32 = 128; // W_T
+    const WHO: u64 = u64::MAX - 3;
+    const LOW: u64 = u64::MAX - 7;
+    const CASH: u64 = u64::MAX - 6;
 
-    let dest = pvm.registers[7] as ServiceId;
-    let amount = pvm.registers[8];
-    let gas_limit = pvm.registers[9];
-    let memo_ptr = pvm.registers[10] as u32;
+    let dest = pvm.reg(7) as ServiceId;
+    let amount = pvm.reg(8);
+    let gas_limit = pvm.reg(9);
+    let memo_ptr = pvm.reg(10) as u32;
 
-    // Read exactly W_T (128) bytes memo from memory
-    let mut memo = vec![0u8; MEMO_SIZE];
-    for (i, byte) in memo.iter_mut().enumerate() {
-        *byte = pvm.memory.read_u8(memo_ptr.wrapping_add(i as u32)).unwrap_or(0);
-    }
+    let memo = pvm.read_bytes(memo_ptr, MEMO_SIZE);
 
-    // Check destination exists
     if !ctx.accounts.contains_key(&dest) {
-        pvm.registers[7] = WHO;
+        pvm.set_reg(7, WHO);
         return true;
     }
 
-    // Check gas limit meets destination's minimum
     if let Some(dest_acc) = ctx.accounts.get(&dest) {
         if gas_limit < dest_acc.min_memo_gas {
-            pvm.registers[7] = LOW;
+            pvm.set_reg(7, LOW);
             return true;
         }
     }
 
-    // Check balance (sender must have enough after transfer)
     if let Some(account) = ctx.accounts.get(&ctx.service_id) {
         if account.balance < amount {
-            pvm.registers[7] = CASH;
+            pvm.set_reg(7, CASH);
             return true;
         }
     }
 
-    // Success: deduct gas_limit (GP: g = 10 + t, t = gas_limit on success)
-    if pvm.gas < gas_limit {
-        // Not enough gas to cover the transfer gas_limit → OOG
-        pvm.gas = 0;
+    if pvm.gas() < gas_limit {
+        pvm.set_gas(0);
         return false;
     }
-    pvm.gas -= gas_limit;
+    pvm.set_gas(pvm.gas() - gas_limit);
 
-    // Deduct balance
     if let Some(account) = ctx.accounts.get_mut(&ctx.service_id) {
         account.balance -= amount;
     }
@@ -952,32 +928,30 @@ fn host_transfer(pvm: &mut grey_pvm::Pvm, ctx: &mut AccContext) -> bool {
         gas_limit,
     });
 
-    pvm.registers[7] = 0; // OK
+    pvm.set_reg(7, 0); // OK
     true
 }
 
 /// eject (id=21): Eject a service (GP eq ΩJ).
 /// φ[7] = target service to eject (d), φ[8] = hash_ptr (o)
 /// On success: removes target, transfers its balance to caller.
-fn host_eject(pvm: &mut grey_pvm::Pvm, ctx: &mut AccContext, _timeslot: Timeslot) -> bool {
+fn host_eject(pvm: &mut PvmInstance, ctx: &mut AccContext, _timeslot: Timeslot) -> bool {
     const WHO: u64 = u64::MAX - 3;
 
-    let target = pvm.registers[7] as ServiceId;
+    let target = pvm.reg(7) as ServiceId;
 
-    // Can't eject self
     if target == ctx.service_id {
-        pvm.registers[7] = WHO;
+        pvm.set_reg(7, WHO);
         return true;
     }
 
     if let Some(ejected) = ctx.accounts.remove(&target) {
-        // Transfer ejected service's balance to current service (caller)
         if let Some(self_acc) = ctx.accounts.get_mut(&ctx.service_id) {
             self_acc.balance = self_acc.balance.saturating_add(ejected.balance);
         }
-        pvm.registers[7] = 0; // OK
+        pvm.set_reg(7, 0); // OK
     } else {
-        pvm.registers[7] = WHO;
+        pvm.set_reg(7, WHO);
     }
 
     true
@@ -985,16 +959,15 @@ fn host_eject(pvm: &mut grey_pvm::Pvm, ctx: &mut AccContext, _timeslot: Timeslot
 
 /// yield (id=25): Set accumulation output hash.
 /// φ[7] = hash_ptr (pointer to 32-byte hash in memory)
-fn host_yield(pvm: &mut grey_pvm::Pvm, ctx: &mut AccContext) -> bool {
-    let hash_ptr = pvm.registers[7] as u32;
+fn host_yield(pvm: &mut PvmInstance, ctx: &mut AccContext) -> bool {
+    let hash_ptr = pvm.reg(7) as u32;
 
+    let data = pvm.read_bytes(hash_ptr, 32);
     let mut hash = [0u8; 32];
-    for (i, byte) in hash.iter_mut().enumerate() {
-        *byte = pvm.memory.read_u8(hash_ptr + i as u32).unwrap_or(0);
-    }
+    hash.copy_from_slice(&data);
 
     ctx.output = Some(Hash(hash));
-    pvm.registers[7] = 0; // OK
+    pvm.set_reg(7, 0); // OK
     true
 }
 

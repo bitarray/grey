@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Chain state representation and block-level state transitions for JAM."
 
+[features]
+default = []
+polkavm = ["dep:polkavm", "dep:polkavm-common"]
+
 [dependencies]
 grey-types = { workspace = true }
 grey-codec = { workspace = true }
@@ -12,8 +16,12 @@ grey-crypto = { workspace = true }
 grey-pvm = { workspace = true }
 grey-merkle = { workspace = true }
 thiserror = { workspace = true }
+polkavm = { workspace = true, optional = true }
+polkavm-common = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
+polkavm = { workspace = true }
+polkavm-common = { workspace = true }

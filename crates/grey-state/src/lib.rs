@@ -4,6 +4,7 @@
 
 pub mod accumulate;
 pub mod assurances;
+pub mod pvm_backend;
 pub mod authorizations;
 pub mod disputes;
 pub mod history;

@@ -44,6 +44,9 @@ pub struct Pvm {
     pub heap_base: u32,
     /// Set of basic block start indices (ϖ).
     basic_block_starts: Vec<bool>,
+    /// Gas cost for each basic block (indexed by block start PC).
+    /// Only entries at basic_block_starts[i]==true are meaningful.
+    pub block_gas_costs: Vec<u64>,
 }
 
 impl Pvm {
@@ -57,6 +60,7 @@ impl Pvm {
         gas: Gas,
     ) -> Self {
         let basic_block_starts = compute_basic_block_starts(&code, &bitmask);
+        let block_gas_costs = compute_block_gas_costs(&code, &bitmask, &basic_block_starts);
         Self {
             gas,
             registers,
@@ -67,6 +71,7 @@ impl Pvm {
             jump_table,
             heap_base: 0,
             basic_block_starts,
+            block_gas_costs,
         }
     }
 
@@ -100,8 +105,8 @@ impl Pvm {
         if i < self.code.len() { self.code[i] } else { 0 }
     }
 
-    /// Check if a code index is a valid basic block start.
-    fn is_basic_block_start(&self, idx: u64) -> bool {
+    /// Check if a code index is a valid basic block start (public accessor).
+    pub fn is_basic_block_start(&self, idx: u64) -> bool {
         let i = idx as usize;
         if i < self.basic_block_starts.len() {
             self.basic_block_starts[i]
@@ -143,7 +148,11 @@ impl Pvm {
 
     /// Execute a single instruction step Ψ₁ (eq A.6-A.9).
     ///
-    /// Returns the exit reason if the machine should stop, or Ok(()) to continue.
+    /// Gas is charged per basic block: the entire block's cost is deducted
+    /// when entering the block (at a basic block start). This matches the
+    /// reference polkavm implementation and enables JIT compilation.
+    ///
+    /// Returns the exit reason if the machine should stop, or None to continue.
     pub fn step(&mut self) -> Option<ExitReason> {
         let pc = self.pc as usize;
 
@@ -166,12 +175,15 @@ impl Pvm {
             }
         };
 
-        // Deduct gas (eq A.9: ϱ' = ϱ - ϱ∆)
-        let cost = opcode.gas_cost();
-        if self.gas < cost {
-            return Some(ExitReason::OutOfGas);
+        // Basic block gas metering: charge the entire block's cost at entry.
+        // Only charge when PC is at a basic block start (ϖ).
+        if pc < self.basic_block_starts.len() && self.basic_block_starts[pc] {
+            let block_cost = self.block_gas_costs[pc];
+            if self.gas < block_cost {
+                return Some(ExitReason::OutOfGas);
+            }
+            self.gas -= block_cost;
         }
-        self.gas -= cost;
 
         // Compute skip length ℓ (eq A.20)
         let skip = self.skip(pc);
@@ -1428,6 +1440,68 @@ fn compute_basic_block_starts(code: &[u8], bitmask: &[u8]) -> Vec<bool> {
     }
 
     starts
+}
+
+/// Compute the gas cost for each basic block.
+///
+/// Gas is charged per basic block at block entry. The cost of a block is
+/// the sum of all instruction gas costs within it (each instruction costs 1).
+/// Returns a vector indexed by code offset; only entries where
+/// basic_block_starts[i]==true are meaningful.
+fn compute_block_gas_costs(code: &[u8], bitmask: &[u8], basic_block_starts: &[bool]) -> Vec<u64> {
+    let len = code.len();
+    let mut costs = vec![0u64; len];
+
+    if len == 0 {
+        return costs;
+    }
+
+    // Helper to compute skip(i) for a given position
+    let skip_at = |i: usize| -> usize {
+        for j in 0..25 {
+            let idx = i + 1 + j;
+            let bit = if idx < bitmask.len() { bitmask[idx] } else { 1 };
+            if bit == 1 {
+                return j;
+            }
+        }
+        24
+    };
+
+    // For each basic block start, count instructions until the next block start
+    // (or end of code). Each instruction costs 1 gas.
+    let mut i = 0;
+    while i < len {
+        if basic_block_starts[i] {
+            // Count instructions in this block
+            let block_start = i;
+            let mut count = 0u64;
+            let mut pos = i;
+            loop {
+                if pos >= len {
+                    break;
+                }
+                if pos < bitmask.len() && bitmask[pos] == 1 {
+                    // This is an instruction start
+                    if pos != block_start && basic_block_starts[pos] {
+                        // Reached next basic block
+                        break;
+                    }
+                    count += 1;
+                    let s = skip_at(pos);
+                    pos = pos + 1 + s;
+                } else {
+                    pos += 1;
+                }
+            }
+            costs[block_start] = count;
+            i = pos;
+        } else {
+            i += 1;
+        }
+    }
+
+    costs
 }
 
 #[cfg(test)]

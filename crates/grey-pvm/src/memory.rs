@@ -87,6 +87,16 @@ impl Memory {
         );
     }
 
+    /// Return the page indices of all mapped pages.
+    pub fn page_indices(&self) -> Vec<u32> {
+        self.pages.keys().copied().collect()
+    }
+
+    /// Read a full page's data (4096 bytes). Returns None if page is not mapped.
+    pub fn read_page(&self, page: u32) -> Option<&[u8]> {
+        self.pages.get(&page).map(|pd| pd.data.as_slice())
+    }
+
     /// Check if an address range is readable (Vµ).
     pub fn is_readable(&self, addr: u32, len: u32) -> bool {
         if len == 0 {
