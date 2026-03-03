@@ -258,7 +258,7 @@ fn run_statistics_test(path: &str) {
     // Apply transition using tiny config
     let config = grey_types::config::Config::tiny();
     let incoming_reports: Vec<&grey_types::work::WorkReport> = extrinsic.guarantees.iter().map(|g| &g.report).collect();
-    statistics::update_statistics(&config, &mut stats, prior_slot, new_slot, author_index, &extrinsic, &incoming_reports, &[], &[]);
+    statistics::update_statistics(&config, &mut stats, prior_slot, new_slot, author_index, &extrinsic, &incoming_reports, &[], &std::collections::BTreeMap::new());
 
     // Parse expected post-state
     let expected_curr: Vec<ValidatorRecord> = post["vals_curr_stats"]

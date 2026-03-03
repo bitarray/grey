@@ -96,6 +96,10 @@ pub struct AccumulateOutput {
     pub outputs: Vec<(ServiceId, Hash)>,
     /// Per-service gas usage from accumulation — needed for π_S statistics.
     pub gas_usage: Vec<(ServiceId, Gas)>,
+    /// Accumulation statistics S (GP eq at line 1892):
+    /// S[s] = (G(s), N(s)) where G = total gas, N = work item count.
+    /// Only includes services where G(s) + N(s) ≠ 0.
+    pub accumulation_stats: BTreeMap<ServiceId, (Gas, u32)>,
 }
 
 /// Deferred transfer between services (eq 12.16).
@@ -1096,6 +1100,14 @@ fn accumulate_batch(
 }
 
 /// Outer accumulation Δ+ (eq 12.18).
+///
+/// GP: Δ+(g, t, r, e, f) where:
+///   g = gas budget, t = deferred transfers, r = work reports,
+///   e = state context, f = always-accumulate services (empty in recursive calls)
+///
+/// n = |t| + i + |f|  — if n = 0, return (base case)
+/// g* = g + Σ(t_g for t in t) — gas augmented by transfer gas
+/// Recursive call uses f = {} (always_acc only in first batch)
 fn accumulate_all(
     gas_budget: Gas,
     transfers: Vec<DeferredTransfer>,
@@ -1112,11 +1124,7 @@ fn accumulate_all(
     Vec<(ServiceId, Gas)>,
     AccPrivileges,
 ) {
-    if reports.is_empty() {
-        return (0, accounts.clone(), vec![], vec![], privileges.clone());
-    }
-
-    // Find max reports that fit in gas budget
+    // Find max reports that fit in gas budget (i in GP)
     let mut gas_sum: Gas = 0;
     let mut max_reports = 0;
     for report in reports {
@@ -1128,47 +1136,53 @@ fn accumulate_all(
         max_reports += 1;
     }
 
-    if max_reports == 0 {
+    // GP: n = |t| + i + |f| — total items to process
+    let n = transfers.len() + max_reports + privileges.always_acc.len();
+    if n == 0 {
         return (0, accounts.clone(), vec![], vec![], privileges.clone());
     }
 
-    // Process this batch
+    // Process this batch: Δ*(e, t, r[..i], f)
     let batch_reports = &reports[..max_reports];
     let (new_accounts, new_transfers, outputs, gas_usage, new_privileges) =
         accumulate_batch(accounts, &transfers, batch_reports, privileges, timeslot, entropy, fetch_ctx);
 
     let batch_gas_used: Gas = gas_usage.iter().map(|(_, g)| *g).sum();
-    let remaining_gas = gas_budget.saturating_sub(batch_gas_used);
 
-    // Process remaining reports recursively
-    if max_reports < reports.len() {
-        let (more_count, final_accounts, more_outputs, more_gas, final_privileges) =
-            accumulate_all(
-                remaining_gas,
-                new_transfers,
-                &reports[max_reports..],
-                &new_accounts,
-                &new_privileges,
-                timeslot,
-                entropy,
-                fetch_ctx,
-            );
+    // GP: g* = g + Σ(t_g for t in t) — augment gas with transfer gas
+    let transfer_gas: Gas = transfers.iter().map(|t| t.gas_limit).sum();
+    let g_star = gas_budget.saturating_add(transfer_gas);
+    let remaining_gas = g_star.saturating_sub(batch_gas_used);
 
-        let mut all_outputs = outputs;
-        all_outputs.extend(more_outputs);
-        let mut all_gas = gas_usage;
-        all_gas.extend(more_gas);
+    // GP: recursive call uses f = {} (always_acc only in first batch)
+    let mut recursive_privileges = new_privileges.clone();
+    recursive_privileges.always_acc = vec![];
 
-        (
-            max_reports + more_count,
-            final_accounts,
-            all_outputs,
-            all_gas,
-            final_privileges,
-        )
-    } else {
-        (max_reports, new_accounts, outputs, gas_usage, new_privileges)
-    }
+    // Always recurse — handles remaining reports AND deferred transfers
+    let (more_count, final_accounts, more_outputs, more_gas, final_privileges) =
+        accumulate_all(
+            remaining_gas,
+            new_transfers,
+            &reports[max_reports..],
+            &new_accounts,
+            &recursive_privileges,
+            timeslot,
+            entropy,
+            fetch_ctx,
+        );
+
+    let mut all_outputs = outputs;
+    all_outputs.extend(more_outputs);
+    let mut all_gas = gas_usage;
+    all_gas.extend(more_gas);
+
+    (
+        max_reports + more_count,
+        final_accounts,
+        all_outputs,
+        all_gas,
+        final_privileges,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1278,12 +1292,28 @@ pub fn process_accumulate(
     // Step 11: Update slot
     state.slot = input.slot;
 
-    // Step 12: Compute output hash (Keccak Merkle root of outputs)
+    // Step 12: Compute accumulation statistics S (GP eq at line 1892)
+    // S[s] = (G(s), N(s)) where G = total gas, N = work item count
+    let mut accum_stats: BTreeMap<ServiceId, (Gas, u32)> = BTreeMap::new();
+    for (sid, gas) in &gas_usage {
+        accum_stats.entry(*sid).or_insert((0, 0)).0 += *gas;
+    }
+    let reports_slice = &accumulatable[..n];
+    for report in reports_slice {
+        for digest in &report.results {
+            accum_stats.entry(digest.service_id).or_insert((0, 0)).1 += 1;
+        }
+    }
+    // Filter: G(s) + N(s) ≠ 0
+    accum_stats.retain(|_, (g, n)| *g + *n as u64 != 0);
+
+    // Step 13: Compute output hash (Keccak Merkle root of outputs)
     let output_hash = compute_output_hash(&outputs);
     AccumulateOutput {
         hash: output_hash,
         outputs,
         gas_usage,
+        accumulation_stats: accum_stats,
     }
 }
 
@@ -1381,20 +1411,31 @@ fn update_statistics(
         }
     }
 
-    // Add accumulation gas usage.
-    // accumulate_count = number of REPORTS that involve each service (not PVM invocations).
+    // Add accumulation gas usage per GP eq at line 1892-1910.
+    // G(s) = Σ(u for (s,u) in u) — total gas used for service s across all batches
+    // N(s) = count of work items (digests) for service s in accumulated reports
+    // S only includes entries where G(s) + N(s) ≠ 0
     for (sid, gas) in gas_usage {
         let entry = stat_map.entry(*sid).or_default();
-        // Count how many reports have results for this service
-        let report_count = reports
-            .iter()
-            .filter(|r| r.results.iter().any(|d| d.service_id == *sid))
-            .count() as u32;
-        entry.accumulate_count += report_count.max(1); // at least 1 if accumulated
         entry.accumulate_gas_used += *gas;
     }
 
-    *stats = stat_map.into_iter().collect();
+    // Compute N(s) — count of work items for each service
+    for (sid, stats_entry) in stat_map.iter_mut() {
+        let item_count: u32 = reports
+            .iter()
+            .flat_map(|r| &r.results)
+            .filter(|d| d.service_id == *sid)
+            .count() as u32;
+        stats_entry.accumulate_count += item_count;
+    }
+
+    // GP: S ≡ { (s ↦ (G(s), N(s))) | G(s) + N(s) ≠ 0 }
+    // Exclude entries where both gas and item count are zero
+    *stats = stat_map
+        .into_iter()
+        .filter(|(_, s)| s.accumulate_gas_used + s.accumulate_count as u64 != 0)
+        .collect();
 }
 
 /// Compute the accumulate output hash (M_K over per-service yields, eq 12.17).
@@ -1571,15 +1612,15 @@ fn ready_to_state_queue(ready: &[Vec<ReadyRecord>]) -> Vec<Vec<(WorkReport, Vec<
 
 /// Run accumulation on available reports, updating the state in-place.
 ///
-/// Returns (accumulate_root_hash, gas_usage) where gas_usage is per-service
-/// accumulation gas for statistics (π_S).
+/// Returns (accumulate_root_hash, accumulation_stats) where accumulation_stats
+/// is the S mapping: service_id → (total_gas, work_item_count) per GP eq 1892.
 pub fn run_accumulation(
     config: &Config,
     state: &mut State,
     prev_timeslot: Timeslot,
     available_reports: Vec<WorkReport>,
     opaque_data: &[([u8; 31], Vec<u8>)],
-) -> (Hash, Vec<(ServiceId, Gas)>) {
+) -> (Hash, BTreeMap<ServiceId, (Gas, u32)>) {
     let epoch_length = config.epoch_length as usize;
 
     tracing::debug!(
@@ -1608,7 +1649,7 @@ pub fn run_accumulation(
         state.accumulation_queue = ready_to_state_queue(&ready);
 
         state.accumulation_outputs = vec![];
-        return (Hash::ZERO, vec![]);
+        return (Hash::ZERO, BTreeMap::new());
     }
 
     // Build AccumulateState from main State
@@ -1634,9 +1675,9 @@ pub fn run_accumulation(
     let acc_output = process_accumulate(config, &mut acc_state, &input);
     tracing::debug!("  accumulate output_hash: {}", acc_output.hash);
 
-    // Build set of accumulated service IDs from gas_usage
+    // Build set of accumulated service IDs from accumulation_stats
     let accumulated_sids: std::collections::BTreeSet<ServiceId> =
-        acc_output.gas_usage.iter().map(|(sid, _)| *sid).collect();
+        acc_output.accumulation_stats.keys().copied().collect();
 
     // Propagate results back to State
     let new_services: BTreeMap<ServiceId, ServiceAccount> = acc_state
@@ -1654,5 +1695,5 @@ pub fn run_accumulation(
     state.privileged_services = acc_to_privileges(&acc_state.privileges);
     state.accumulation_outputs = acc_output.outputs.clone();
 
-    (acc_output.hash, acc_output.gas_usage)
+    (acc_output.hash, acc_output.accumulation_stats)
 }

@@ -58,7 +58,7 @@ pub fn apply_with_config(state: &State, block: &Block, config: &Config, opaque_d
     process_guarantees(&mut new_state, &extrinsic.guarantees, header.timeslot)?;
 
     // Step 7: Accumulation (Section 12)
-    let (accumulate_root, accumulation_gas_usage) = crate::accumulate::run_accumulation(
+    let (accumulate_root, accumulation_stats) = crate::accumulate::run_accumulation(
         config,
         &mut new_state,
         state.timeslot,
@@ -91,7 +91,7 @@ pub fn apply_with_config(state: &State, block: &Block, config: &Config, opaque_d
         extrinsic,
         &incoming_reports,
         &available_reports,
-        &accumulation_gas_usage,
+        &accumulation_stats,
     );
 
     // Step 10: Process preimages (Section 12.4)
@@ -407,6 +407,32 @@ fn rotate_auth_pool(
         }
 
     }
+}
+
+// Debug wrapper functions for step-by-step conformance debugging
+pub fn debug_apply_safrole(
+    state: &mut State,
+    header: &grey_types::header::Header,
+    config: &Config,
+) {
+    apply_safrole(state, header, config);
+}
+
+pub fn debug_process_assurances(
+    state: &mut State,
+    assurances: &grey_types::header::AssurancesExtrinsic,
+    timeslot: grey_types::Timeslot,
+    config: &Config,
+) -> Vec<grey_types::work::WorkReport> {
+    process_assurances(state, assurances, timeslot, config)
+}
+
+pub fn debug_process_guarantees(
+    state: &mut State,
+    guarantees: &grey_types::header::GuaranteesExtrinsic,
+    timeslot: grey_types::Timeslot,
+) -> Result<(), TransitionError> {
+    process_guarantees(state, guarantees, timeslot)
 }
 
 #[cfg(test)]

@@ -26,7 +26,7 @@ pub fn update_statistics(
     extrinsic: &Extrinsic,
     incoming_reports: &[&WorkReport],
     available_reports: &[WorkReport],
-    accumulation_gas_usage: &[(grey_types::ServiceId, grey_types::Gas)],
+    accumulation_stats: &std::collections::BTreeMap<grey_types::ServiceId, (grey_types::Gas, u32)>,
 ) {
     let old_epoch = prior_timeslot / config.epoch_length;
     let new_epoch = new_timeslot / config.epoch_length;
@@ -81,7 +81,7 @@ pub fn update_statistics(
     compute_core_statistics(config, stats, &extrinsic.assurances, incoming_reports, available_reports);
 
     // Compute per-service statistics π_S (eq 13.3)
-    compute_service_statistics(stats, extrinsic, incoming_reports, accumulation_gas_usage);
+    compute_service_statistics(stats, extrinsic, incoming_reports, accumulation_stats);
 }
 
 /// Compute per-core statistics π_C (GP eq 2046-2085).
@@ -159,11 +159,11 @@ fn compute_service_statistics(
     stats: &mut ValidatorStatistics,
     extrinsic: &Extrinsic,
     incoming_reports: &[&WorkReport],
-    accumulation_gas_usage: &[(grey_types::ServiceId, grey_types::Gas)],
+    accumulation_stats: &std::collections::BTreeMap<grey_types::ServiceId, (grey_types::Gas, u32)>,
 ) {
     let mut svc_stats: BTreeMap<grey_types::ServiceId, ServiceStatistics> = BTreeMap::new();
 
-    // s^R: services from incoming work digests
+    // s^R: services from incoming work digests (GP eq 2121-2142: R(s))
     for report in incoming_reports {
         for digest in &report.results {
             let entry = svc_stats.entry(digest.service_id).or_default();
@@ -183,11 +183,12 @@ fn compute_service_statistics(
         entry.provided_size += data.len() as u64;
     }
 
-    // s^A: services from accumulation
-    for (service_id, gas) in accumulation_gas_usage {
+    // K(S): services from accumulation statistics (GP eq 2113: a ≔ U(S[s], (0,0)))
+    // S[s] = (G(s), N(s)) — gas and work item count
+    for (service_id, (gas, item_count)) in accumulation_stats {
         let entry = svc_stats.entry(*service_id).or_default();
-        entry.accumulate_count += 1;
         entry.accumulate_gas_used += *gas;
+        entry.accumulate_count += *item_count as u64;
     }
 
     stats.service_stats = svc_stats;
