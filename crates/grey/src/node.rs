@@ -9,6 +9,7 @@
 //! 6. Process work packages and generate guarantees/assurances
 
 use crate::audit::{self, AuditState};
+use crate::finality::{self, GrandpaState};
 use crate::guarantor::{self, GuarantorState};
 use grey_codec::header_codec::compute_header_hash;
 use grey_consensus::authoring;
@@ -42,35 +43,7 @@ pub struct NodeConfig {
     pub rpc_port: u16,
 }
 
-/// Finality tracker: simplified finality (finalize after N block depth).
-struct FinalityTracker {
-    /// Finalized block timeslot.
-    finalized_slot: Timeslot,
-    /// Finality depth (number of blocks before considering finalized).
-    finality_depth: u32,
-}
-
-impl FinalityTracker {
-    fn new(finality_depth: u32) -> Self {
-        Self {
-            finalized_slot: 0,
-            finality_depth,
-        }
-    }
-
-    /// Update finalization based on the current best block.
-    /// Returns the newly finalized timeslot if finality advanced.
-    fn update(&mut self, current_slot: Timeslot) -> Option<Timeslot> {
-        if current_slot > self.finality_depth {
-            let new_finalized = current_slot - self.finality_depth;
-            if new_finalized > self.finalized_slot {
-                self.finalized_slot = new_finalized;
-                return Some(new_finalized);
-            }
-        }
-        None
-    }
-}
+// FinalityTracker replaced by GrandpaState (see finality.rs)
 
 /// Run the validator node.
 pub async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -137,7 +110,7 @@ pub async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
 
     // Initialize state
     let mut state = genesis_state;
-    let mut finality = FinalityTracker::new(3); // Finalize after 3-block depth
+    let mut grandpa = GrandpaState::new(protocol.validators_count);
     let mut blocks_authored = 0u64;
     let mut blocks_imported = 0u64;
     let genesis_time = config.genesis_time;
@@ -301,16 +274,29 @@ pub async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
                                     data: block_data,
                                 });
 
-                                // Check finality
-                                if let Some(finalized) = finality.update(current_slot) {
-                                    if let Ok(fin_hash) = store.get_block_hash_by_slot(finalized) {
-                                        let _ = store.set_finalized(&fin_hash, finalized);
-                                    }
-                                    tracing::info!(
-                                        "Validator {} FINALIZED slot {}",
-                                        config.validator_index,
-                                        finalized
-                                    );
+                                // Update GRANDPA best block and vote
+                                grandpa.update_best_block(header_hash, current_slot);
+
+                                // Send prevote for the new block
+                                if let Some(prevote_msg) = grandpa.create_prevote(
+                                    config.validator_index,
+                                    my_secrets,
+                                ) {
+                                    let vote_data = finality::encode_vote_message(&prevote_msg);
+                                    let _ = net_commands.send(NetworkCommand::BroadcastFinalityVote {
+                                        data: vote_data,
+                                    });
+                                }
+
+                                // Try to precommit if prevote threshold reached
+                                if let Some(precommit_msg) = grandpa.create_precommit(
+                                    config.validator_index,
+                                    my_secrets,
+                                ) {
+                                    let vote_data = finality::encode_vote_message(&precommit_msg);
+                                    let _ = net_commands.send(NetworkCommand::BroadcastFinalityVote {
+                                        data: vote_data,
+                                    });
                                 }
                             }
                             Err(e) => {
@@ -436,15 +422,25 @@ pub async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
                                                 blocks_imported
                                             );
 
-                                            if let Some(finalized) = finality.update(slot) {
-                                                if let Ok(fin_hash) = store.get_block_hash_by_slot(finalized) {
-                                                    let _ = store.set_finalized(&fin_hash, finalized);
-                                                }
-                                                tracing::info!(
-                                                    "Validator {} FINALIZED slot {}",
-                                                    config.validator_index,
-                                                    finalized
-                                                );
+                                            // Update GRANDPA and vote on imported block
+                                            grandpa.update_best_block(import_hash, slot);
+                                            if let Some(prevote_msg) = grandpa.create_prevote(
+                                                config.validator_index,
+                                                my_secrets,
+                                            ) {
+                                                let vote_data = finality::encode_vote_message(&prevote_msg);
+                                                let _ = net_commands.send(NetworkCommand::BroadcastFinalityVote {
+                                                    data: vote_data,
+                                                });
+                                            }
+                                            if let Some(precommit_msg) = grandpa.create_precommit(
+                                                config.validator_index,
+                                                my_secrets,
+                                            ) {
+                                                let vote_data = finality::encode_vote_message(&precommit_msg);
+                                                let _ = net_commands.send(NetworkCommand::BroadcastFinalityVote {
+                                                    data: vote_data,
+                                                });
                                             }
                                         }
                                         Err(e) => {
@@ -467,8 +463,55 @@ pub async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
                             }
                         }
                     }
-                    NetworkEvent::FinalityVote { .. } => {
-                        // Simplified: we don't process explicit finality votes yet
+                    NetworkEvent::FinalityVote { data, source } => {
+                        if let Some(vote_msg) = finality::decode_vote_message(&data) {
+                            if finality::verify_vote(&vote_msg.vote, vote_msg.vote_type, &state) {
+                                match vote_msg.vote_type {
+                                    finality::VoteType::Prevote => {
+                                        let threshold_reached = grandpa.add_prevote(vote_msg.vote);
+                                        if threshold_reached {
+                                            tracing::info!(
+                                                "Validator {} prevote threshold reached in round {}",
+                                                config.validator_index,
+                                                grandpa.round
+                                            );
+                                            // Try to precommit now that we have prevote supermajority
+                                            if let Some(precommit_msg) = grandpa.create_precommit(
+                                                config.validator_index,
+                                                my_secrets,
+                                            ) {
+                                                let vote_data = finality::encode_vote_message(&precommit_msg);
+                                                let _ = net_commands.send(NetworkCommand::BroadcastFinalityVote {
+                                                    data: vote_data,
+                                                });
+                                            }
+                                        }
+                                    }
+                                    finality::VoteType::Precommit => {
+                                        if let Some((fin_hash, fin_slot)) = grandpa.add_precommit(vote_msg.vote) {
+                                            tracing::info!(
+                                                "Validator {} GRANDPA FINALIZED slot {} hash=0x{}",
+                                                config.validator_index,
+                                                fin_slot,
+                                                hex::encode(&fin_hash.0[..8])
+                                            );
+                                            let _ = store.set_finalized(&fin_hash, fin_slot);
+
+                                            // Advance to next round
+                                            if grandpa.should_advance_round() {
+                                                grandpa.advance_round();
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                tracing::warn!(
+                                    "Validator {} received invalid finality vote from {}",
+                                    config.validator_index,
+                                    source
+                                );
+                            }
+                        }
                     }
                     NetworkEvent::AnnouncementReceived { data, source } => {
                         if let Some(ann) = audit::decode_announcement(&data) {
@@ -598,7 +641,7 @@ pub async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
             status.head_slot = state.timeslot;
             status.blocks_authored = blocks_authored;
             status.blocks_imported = blocks_imported;
-            status.finalized_slot = finality.finalized_slot;
+            status.finalized_slot = grandpa.finalized_slot;
             if let Ok((h, _)) = store.get_head() {
                 status.head_hash = hex::encode(h.0);
             }
