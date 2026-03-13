@@ -2,6 +2,13 @@
 //!
 //! This crate defines the foundational types matching the Gray Paper specification v0.7.2.
 //! Greek-letter state components are mapped to descriptive Rust names.
+//!
+//! Supports `no_std` environments with `alloc`. The `std` feature enables `std` support
+//! for `hex` and `serde`.
+
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
 
 pub mod config;
 pub mod constants;
@@ -11,7 +18,10 @@ pub mod state;
 pub mod validator;
 pub mod work;
 
-use std::fmt;
+use core::fmt;
+
+use alloc::string::String;
+use alloc::vec::Vec;
 
 /// Decode a 0x-prefixed hex string to bytes.
 pub fn decode_hex(s: &str) -> Result<Vec<u8>, hex::FromHexError> {
@@ -20,16 +30,16 @@ pub fn decode_hex(s: &str) -> Result<Vec<u8>, hex::FromHexError> {
 
 /// Decode hex string into a fixed-size array.
 pub fn decode_hex_fixed<const N: usize>(s: &str) -> Result<[u8; N], String> {
-    let bytes = decode_hex(s).map_err(|e| e.to_string())?;
+    let bytes = decode_hex(s).map_err(|e| alloc::format!("{}", e))?;
     if bytes.len() != N {
-        return Err(format!("expected {} bytes, got {}", N, bytes.len()));
+        return Err(alloc::format!("expected {} bytes, got {}", N, bytes.len()));
     }
     let mut arr = [0u8; N];
     arr.copy_from_slice(&bytes);
     Ok(arr)
 }
 
-/// Implement Debug (with truncation), Deserialize, and Default (for large arrays) for crypto types.
+/// Implement Debug, Default, serde Deserialize, and from_hex for crypto wrapper types.
 macro_rules! impl_crypto_type {
     // Fixed-size array with Copy — full hex in Debug
     ($name:ident, $size:expr, copy, $debug_name:expr) => {
@@ -45,7 +55,7 @@ macro_rules! impl_crypto_type {
             }
         }
     };
-    // Large array — truncated Debug, manual Default
+    // Large array — manual Default + truncated Debug
     ($name:ident, $size:expr, large, $debug_name:expr) => {
         impl Default for $name {
             fn default() -> Self { Self([0u8; $size]) }
@@ -116,7 +126,7 @@ impl<'de> serde::Deserialize<'de> for Hash {
 
 impl serde::Serialize for Hash {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&format!("0x{}", hex::encode(self.0)))
+        s.serialize_str(&alloc::format!("0x{}", hex::encode(self.0)))
     }
 }
 

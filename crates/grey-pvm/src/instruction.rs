@@ -229,7 +229,7 @@ impl Opcode {
     pub fn from_byte(byte: u8) -> Option<Self> {
         if OPCODE_TABLE[byte as usize] != 0 {
             // SAFETY: we verified the byte is a valid opcode via lookup table
-            Some(unsafe { std::mem::transmute(byte) })
+            Some(unsafe { core::mem::transmute(byte) })
         } else {
             None
         }

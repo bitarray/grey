@@ -4,6 +4,8 @@
 //! variant used for testing. This module provides a config type that holds these
 //! parameters at runtime.
 
+use alloc::vec::Vec;
+
 /// Protocol configuration parameters.
 #[derive(Clone, Debug)]
 pub struct Config {
