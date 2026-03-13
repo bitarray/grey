@@ -80,6 +80,72 @@ impl BandersnatchKeypair {
         self.vrf_sign(unsigned_header_hash, ad)
     }
 
+    /// Create a Ring VRF signature (784 bytes) proving membership in a ring of keys.
+    ///
+    /// Returns `[32-byte VRF output point | 752-byte ring proof]`.
+    /// Used for anonymous ticket submission (eq 6.29).
+    ///
+    /// Parameters:
+    /// - `ring_keys`: All Bandersnatch public keys in the ring (validator set)
+    /// - `key_index`: This validator's position in the ring
+    /// - `input_data`: VRF input (e.g., X_T ⌢ η₂ ⌢ attempt)
+    /// - `ad`: Additional authenticated data
+    pub fn ring_vrf_sign(
+        &self,
+        ring_keys: &[[u8; 32]],
+        key_index: usize,
+        input_data: &[u8],
+        ad: &[u8],
+    ) -> Option<Vec<u8>> {
+        use ark_vrf::ring::Prover as _;
+
+        let input = ark_vrf::Input::<Suite>::new(input_data)?;
+        let output = self.secret.output(input);
+
+        let params = make_ring_params(ring_keys.len());
+
+        // Deserialize all public keys to affine points
+        let points: Vec<AffinePoint> = ring_keys
+            .iter()
+            .map(|key_bytes| {
+                AffinePoint::deserialize_compressed(&key_bytes[..])
+                    .unwrap_or(RingProofParams::padding_point())
+            })
+            .collect();
+
+        // Create prover key and prover instance bound to our position
+        let prover_key = params.prover_key(&points);
+        let prover = params.prover(prover_key, key_index);
+
+        // Generate the ring proof
+        let proof = self.secret.prove(input, output, ad, &prover);
+
+        // Serialize: [32-byte output | ring proof]
+        let mut result = Vec::new();
+        output
+            .0
+            .serialize_compressed(&mut result)
+            .ok()?;
+        proof
+            .serialize_compressed(&mut result)
+            .ok()?;
+
+        Some(result)
+    }
+
+    /// Compute the VRF output hash for a given input, without producing a proof.
+    ///
+    /// Used for ticket ownership detection: compute ticket ID for each attempt
+    /// and check if it matches any ticket in the seal-key series.
+    pub fn vrf_output_for_input(&self, input_data: &[u8]) -> Option<[u8; 32]> {
+        let input = ark_vrf::Input::<Suite>::new(input_data)?;
+        let output = self.secret.output(input);
+        let hash = output.hash();
+        let mut result = [0u8; 32];
+        result.copy_from_slice(&hash[..32]);
+        Some(result)
+    }
+
     /// Produce deterministic VRF-like bytes when VRF input construction fails.
     /// Uses the public key point as a valid curve point in the output.
     fn deterministic_vrf_bytes(&self, _data: &[u8]) -> [u8; 96] {
@@ -305,8 +371,92 @@ mod tests {
         assert_eq!(
             commitment, expected_arr,
             "Ring commitment mismatch.\nGot:      {}\nExpected: {}",
-            hex::encode(commitment),
+            hex::encode(&commitment),
             hex::encode(expected_arr)
         );
+    }
+
+    #[test]
+    fn test_ring_vrf_sign_and_verify() {
+        // Create a ring of 6 keypairs
+        let keypairs: Vec<BandersnatchKeypair> = (0..6u8)
+            .map(|i| {
+                let mut seed = [0u8; 32];
+                seed[0] = i;
+                seed[31] = 0xBA;
+                BandersnatchKeypair::from_seed(&seed)
+            })
+            .collect();
+
+        let ring_keys: Vec<[u8; 32]> = keypairs.iter().map(|kp| kp.public_key_bytes()).collect();
+
+        // Compute the ring commitment
+        let commitment = compute_ring_commitment(&ring_keys);
+
+        // Prover at index 2 signs
+        let prover_idx = 2;
+        let eta2 = [0u8; 32];
+        let attempt = 0u8;
+
+        let mut vrf_input = Vec::new();
+        vrf_input.extend_from_slice(TICKET_SEAL_CONTEXT);
+        vrf_input.extend_from_slice(&eta2);
+        vrf_input.push(attempt);
+
+        let proof = keypairs[prover_idx]
+            .ring_vrf_sign(&ring_keys, prover_idx, &vrf_input, &[])
+            .expect("ring_vrf_sign should succeed");
+
+        // Verify the proof
+        let ticket_id = ring_vrf_verify(6, &commitment, &vrf_input, &[], &proof);
+        assert!(ticket_id.is_some(), "ring_vrf_verify should succeed");
+
+        // Also verify via verify_ticket
+        let ticket_id2 = verify_ticket(6, &commitment, &eta2, attempt, &proof);
+        assert_eq!(ticket_id, ticket_id2);
+
+        // The ticket ID should match vrf_output_for_input
+        let expected_id = keypairs[prover_idx].vrf_output_for_input(&vrf_input);
+        assert_eq!(ticket_id, expected_id, "ticket ID should match VRF output");
+    }
+
+    #[test]
+    fn test_ticket_ownership_detection() {
+        let keypairs: Vec<BandersnatchKeypair> = (0..6u8)
+            .map(|i| {
+                let mut seed = [0u8; 32];
+                seed[0] = i;
+                seed[31] = 0xBA;
+                BandersnatchKeypair::from_seed(&seed)
+            })
+            .collect();
+
+        let eta2 = [7u8; 32];
+
+        // Compute ticket IDs for validator 3, attempt 0
+        let mut vrf_input = Vec::new();
+        vrf_input.extend_from_slice(TICKET_SEAL_CONTEXT);
+        vrf_input.extend_from_slice(&eta2);
+        vrf_input.push(0);
+
+        let ticket_id = keypairs[3].vrf_output_for_input(&vrf_input).unwrap();
+
+        // Validator 3 should detect ownership
+        assert_eq!(
+            keypairs[3].vrf_output_for_input(&vrf_input),
+            Some(ticket_id)
+        );
+
+        // Other validators should NOT produce the same ticket ID
+        for (i, kp) in keypairs.iter().enumerate() {
+            if i != 3 {
+                assert_ne!(
+                    kp.vrf_output_for_input(&vrf_input),
+                    Some(ticket_id),
+                    "validator {} should not match validator 3's ticket",
+                    i
+                );
+            }
+        }
     }
 }
