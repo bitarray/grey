@@ -2,6 +2,9 @@
 //!
 //! Implements the single-step state transition Ψ₁ and the full PVM Ψ.
 
+use alloc::vec;
+use alloc::vec::Vec;
+use core::cmp;
 use crate::args::{self, Args};
 use crate::instruction::Opcode;
 use crate::memory::{Memory, MemoryAccess};
@@ -1654,10 +1657,10 @@ impl Pvm {
                 Opcode::AndInv => { self.registers[rd] = self.registers[ra] & !self.registers[rb]; }
                 Opcode::OrInv => { self.registers[rd] = self.registers[ra] | !self.registers[rb]; }
                 Opcode::Xnor => { self.registers[rd] = !(self.registers[ra] ^ self.registers[rb]); }
-                Opcode::Max => { self.registers[rd] = std::cmp::max(self.registers[ra] as i64, self.registers[rb] as i64) as u64; }
-                Opcode::MaxU => { self.registers[rd] = std::cmp::max(self.registers[ra], self.registers[rb]); }
-                Opcode::Min => { self.registers[rd] = std::cmp::min(self.registers[ra] as i64, self.registers[rb] as i64) as u64; }
-                Opcode::MinU => { self.registers[rd] = std::cmp::min(self.registers[ra], self.registers[rb]); }
+                Opcode::Max => { self.registers[rd] = cmp::max(self.registers[ra] as i64, self.registers[rb] as i64) as u64; }
+                Opcode::MaxU => { self.registers[rd] = cmp::max(self.registers[ra], self.registers[rb]); }
+                Opcode::Min => { self.registers[rd] = cmp::min(self.registers[ra] as i64, self.registers[rb] as i64) as u64; }
+                Opcode::MinU => { self.registers[rd] = cmp::min(self.registers[ra], self.registers[rb]); }
 
                 // === All other instructions: delegate to execute() ===
                 _ => {

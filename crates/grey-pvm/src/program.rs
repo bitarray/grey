@@ -3,6 +3,8 @@
 //! Includes `deblob` for parsing program blobs (eq A.2) and
 //! standard program initialization Y(p, a) (eq A.37).
 
+use alloc::vec;
+use alloc::vec::Vec;
 use crate::memory::{Memory, PageAccess};
 use crate::vm::Pvm;
 use grey_types::constants::{PVM_INIT_INPUT_SIZE, PVM_PAGE_SIZE, PVM_ZONE_SIZE};

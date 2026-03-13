@@ -1,7 +1,9 @@
 //! Work-related types: reports, digests, packages (Sections 11, 14).
 
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+
 use crate::{CoreIndex, Gas, Hash, ServiceId, Timeslot};
-use std::collections::BTreeMap;
 
 /// Work report R (eq 11.2).
 #[derive(Clone, Debug)]

@@ -1348,7 +1348,6 @@ version = "0.1.0"
 dependencies = [
  "grey-types",
  "libc",
- "thiserror 2.0.18",
  "tracing",
 ]
 
@@ -2919,6 +2918,8 @@ dependencies = [
 [[package]]
 name = "polkavm"
 version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4323d016144b2852da47cee55ca5fc33dfe7517be1f52395759f247ecc5695f6"
 dependencies = [
  "libc",
  "log",
@@ -2931,6 +2932,8 @@ dependencies = [
 [[package]]
 name = "polkavm-assembler"
 version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b3a873fa7ace058d6507debf5fccb1d06bd3279f5b35dbaf70dc7fe94a6c415c"
 dependencies = [
  "log",
 ]
@@ -2938,6 +2941,8 @@ dependencies = [
 [[package]]
 name = "polkavm-common"
 version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed1b408db93d4f49f5c651a7844682b9d7a561827b4dc6202c10356076c055c9"
 dependencies = [
  "log",
  "picosimd",
@@ -2947,6 +2952,8 @@ dependencies = [
 [[package]]
 name = "polkavm-linux-raw"
 version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "604b23cdb201979304449f53d21bfd5fb1724c03e3ea889067c9a3bf7ae33862"
 
 [[package]]
 name = "polling"
@@ -4927,3 +4934,11 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
+
+[[patch.unused]]
+name = "polkavm"
+version = "0.32.0"
+
+[[patch.unused]]
+name = "polkavm-common"
+version = "0.32.0"

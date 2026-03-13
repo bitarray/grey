@@ -3,8 +3,10 @@
 //! Memory is a 32-bit addressable space organized into pages of ZP = 4096 bytes.
 //! Each page has an access mode: Read-only, Read-Write, or Inaccessible.
 
+use alloc::collections::BTreeMap;
+use alloc::vec;
+use alloc::vec::Vec;
 use grey_types::constants::PVM_PAGE_SIZE;
-use std::collections::BTreeMap;
 
 /// Page access mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

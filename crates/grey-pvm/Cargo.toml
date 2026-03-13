@@ -5,8 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "Polkadot Virtual Machine (PVM) implementation for JAM."
 
+[features]
+default = ["std"]
+std = ["grey-types/std", "tracing/std", "libc"]
+
 [dependencies]
-grey-types = { workspace = true }
-libc = "0.2"
-thiserror = { workspace = true }
+grey-types = { path = "../grey-types", default-features = false }
+libc = { version = "0.2", optional = true }
 tracing = { workspace = true }

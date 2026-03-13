@@ -2,13 +2,15 @@
 //!
 //! σ ≡ (α, β, θ, γ, δ, η, ι, κ, λ, ρ, τ, ϕ, χ, ψ, π, ω, ξ)
 
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::vec::Vec;
+
 use crate::header::Ticket;
 use crate::validator::ValidatorKey;
 use crate::work::WorkReport;
 use crate::{
     BandersnatchPublicKey, BandersnatchRingRoot, Ed25519PublicKey, Gas, Hash, ServiceId, Timeslot,
 };
-use std::collections::{BTreeMap, BTreeSet};
 
 /// The complete JAM chain state σ (eq 4.4).
 #[derive(Clone, Debug)]

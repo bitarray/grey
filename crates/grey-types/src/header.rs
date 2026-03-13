@@ -1,5 +1,7 @@
 //! Block header types (Section 5 of the Gray Paper).
 
+use alloc::vec::Vec;
+
 use crate::{
     BandersnatchPublicKey, BandersnatchSignature, Ed25519PublicKey, Hash, Timeslot, ValidatorIndex,
 };
