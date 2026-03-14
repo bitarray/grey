@@ -792,14 +792,36 @@ impl Assembler {
 
     // -- Branches and jumps --
 
-    /// jmp rel32 to label
+    /// jmp to label — uses rel8 for backward jumps within ±127 bytes.
     pub fn jmp_label(&mut self, label: Label) {
+        if let Some(&target) = self.labels.get(&label) {
+            // Backward jump — label already bound, try rel8.
+            // rel8 offset = target - (current + 2), where 2 = size of jmp rel8
+            let rel = target as isize - (self.code.len() as isize + 2);
+            if rel >= i8::MIN as isize && rel <= i8::MAX as isize {
+                self.emit(0xEB);
+                self.emit(rel as u8);
+                return;
+            }
+        }
+        // Forward jump or out of rel8 range — use rel32
         self.emit(0xE9);
         self.emit_label_fixup(label);
     }
 
-    /// jcc rel32 to label
+    /// jcc to label — uses rel8 for backward jumps within ±127 bytes.
     pub fn jcc_label(&mut self, cc: Cc, label: Label) {
+        if let Some(&target) = self.labels.get(&label) {
+            // Backward jump — label already bound, try rel8.
+            // rel8 offset = target - (current + 2), where 2 = size of jcc rel8
+            let rel = target as isize - (self.code.len() as isize + 2);
+            if rel >= i8::MIN as isize && rel <= i8::MAX as isize {
+                self.emit(0x70 + cc as u8);
+                self.emit(rel as u8);
+                return;
+            }
+        }
+        // Forward jump or out of rel8 range — use rel32
         self.emit(0x0F);
         self.emit(0x80 + cc as u8);
         self.emit_label_fixup(label);
