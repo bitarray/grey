@@ -151,6 +151,7 @@ pub async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
     // Main loop: check timeslots every 500ms
     let mut interval = tokio::time::interval(Duration::from_millis(500));
     let mut last_authored_slot: Timeslot = 0;
+    let mut last_assurance_slot: Timeslot = 0;
 
     loop {
         tokio::select! {
@@ -188,33 +189,35 @@ pub async fn run_node(config: NodeConfig) -> Result<(), Box<dyn std::error::Erro
 
                 // Only attempt authoring if this is a new slot we haven't authored yet
                 if current_slot > state.timeslot && current_slot > last_authored_slot {
-                    // Generate our own assurance at the START of the slot (first tick).
+                    // Generate our own assurance once at the START of the slot.
                     // Broadcast it immediately so other validators receive it before authoring.
-                    let parent_hash = state
-                        .recent_blocks
-                        .headers
-                        .last()
-                        .map(|h| h.header_hash)
-                        .unwrap_or(Hash::ZERO);
+                    if current_slot > last_assurance_slot {
+                        last_assurance_slot = current_slot;
+                        let parent_hash = state
+                            .recent_blocks
+                            .headers
+                            .last()
+                            .map(|h| h.header_hash)
+                            .unwrap_or(Hash::ZERO);
 
-                    if let Some(my_assurance) = guarantor_state.generate_assurance(
-                        protocol,
-                        &parent_hash,
-                        config.validator_index,
-                        my_secrets,
-                        &state,
-                    ) {
-                        tracing::info!(
-                            "Validator {} generated assurance for {} cores",
+                        if let Some(my_assurance) = guarantor_state.generate_assurance(
+                            protocol,
+                            &parent_hash,
                             config.validator_index,
-                            my_assurance.bitfield.iter().map(|b| b.count_ones()).sum::<u32>()
-                        );
-                        // Broadcast our assurance
-                        let assurance_data = guarantor::encode_assurance(&my_assurance);
-                        let _ = net_commands.send(NetworkCommand::BroadcastAssurance {
-                            data: assurance_data,
-                        });
-                        collected_assurances.push(my_assurance);
+                            my_secrets,
+                            &state,
+                        ) {
+                            tracing::info!(
+                                "Validator {} generated assurance for {} cores",
+                                config.validator_index,
+                                my_assurance.bitfield.iter().map(|b| b.count_ones()).sum::<u32>()
+                            );
+                            let assurance_data = guarantor::encode_assurance(&my_assurance);
+                            let _ = net_commands.send(NetworkCommand::BroadcastAssurance {
+                                data: assurance_data,
+                            });
+                            collected_assurances.push(my_assurance);
+                        }
                     }
 
                     // Delay block authoring by 2 seconds into the slot to allow
