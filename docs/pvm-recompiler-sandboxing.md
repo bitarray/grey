@@ -242,36 +242,33 @@ lea  edx, [ra_reg + imm]
 mov  rd_reg, dword [guest_base + rdx]     ; 1 instruction, ~1-4 cycles
 ```
 
-Our recompiler mediates every access through a helper function call:
+Our recompiler now uses **inline memory access** with a flat buffer and
+permission table (Option A below, implemented):
 
 ```x86
-; grey: load_u32 rd, [ra + imm]
-push rsi; push rdi; push r8; ...; push rcx   ; save 8 caller-saved regs
-mov  rdi, r15                                  ; arg0 = ctx
-lea  esi, [ra_reg + imm]                       ; arg1 = addr
-mov  rax, <mem_read_u32>
-call rax                                       ; → BTreeMap::get → data[offset]
-mov  scratch, rax
-pop  rcx; ...; pop rsi                         ; restore 8 regs
-cmp  dword [r15+120], 0                        ; check for page fault
-jne  exit
-mov  rd_reg, scratch
+; grey: load_u32 rd, [ra + imm]  —  5 instructions (fast path)
+lea  edx, [ra_reg + imm]                       ; guest address
+mov  ecx, edx
+shr  ecx, 12                                   ; page index
+cmp  byte [r15 + rcx - 1052672], 1             ; permission check
+jb   page_fault_exit
+mov  rd_reg, dword [r15 + rdx]                 ; direct load
 ```
 
-That is **~25 instructions + a BTreeMap lookup** vs **1 instruction**. On
-memory-heavy workloads (e.g. Merkle tree computation, data copying), this is
-a 20-50x penalty per access.
+That is **5 instructions** vs polkavm's **1 instruction**. The gap is from
+the software permission check (3 instructions) that polkavm avoids by using
+hardware page protection (mprotect + SIGSEGV).
 
-The current fib benchmark doesn't exercise memory, so it hides this cost.
-Any real-world PVM program (accumulate, refine) will hit memory heavily.
+A sort benchmark (1K u32 insertion sort) measures this directly:
+grey-recompiler = 846µs, polkavm-compiler = 436µs (1.94x gap).
 
 ### Design Options
 
 Three approaches, from simplest to most aggressive:
 
-#### Option A: Flat backing buffer + inline permission check (recommended)
+#### Option A: Flat backing buffer + inline permission check — ✅ IMPLEMENTED
 
-Replace the `BTreeMap<u32, PageData>` with:
+Replaced the `BTreeMap<u32, PageData>` with:
 - A **contiguous backing buffer** for guest data, `mmap`'d with
   `MAP_NORESERVE` (lazy physical allocation)
 - A **page permission table** — one byte per page (1MB for 2^20 pages)
@@ -307,8 +304,13 @@ the address is 32-bit, so it cannot reach host memory outside the buffer.
 **Compatibility**: `mmap(MAP_NORESERVE)` works everywhere including
 containers. No special syscalls required.
 
-This is the approach we should implement. It gives us ~4-8x improvement on
-memory-heavy code compared to helper calls, while staying fully in-process.
+This is implemented. The actual improvement was **71x** on memory-heavy code
+(sort benchmark: 60ms → 846µs). The implementation goes further than originally
+planned: R15 points directly to guest memory (eliminating a pointer load per
+access), the permission table is at a fixed negative offset from R15 (enabling
+SIB+disp32 addressing in a single instruction), and RCX is freed as a second
+scratch register by spilling phi[12] to context memory (eliminating push/pop
+RAX per access).
 
 #### Option B: Signal-handler page protection
 
@@ -350,47 +352,47 @@ call overhead (~20 instructions for save/restore) remains.
 **Verdict**: Quick win as a stepping stone. Not sufficient long-term for
 memory-heavy workloads due to the inherent function call overhead.
 
-### Implementation Plan for Option A
+### Implementation Status for Option A — ✅ DONE
 
-Changes required:
+What was implemented (see `crates/grey-pvm/src/recompiler/`):
 
-1. **New `FlatMemory` struct** (or refactor `Memory`):
-   - `buf: *mut u8` — mmap'd backing buffer (up to 4GB, MAP_NORESERVE)
-   - `perms: Vec<u8>` — page permission table (1 byte per page)
-   - Methods to sync with the existing `Memory` API (map_page, sbrk, etc.)
+1. **`FlatMemory` struct** in `mod.rs`: contiguous mmap region containing
+   permission table (1MB) + JitContext (4KB page) + guest memory (4GB).
+   All MAP_NORESERVE for lazy physical allocation.
 
-2. **New JitContext fields**:
-   - `guest_buf: *mut u8` (offset 192) — backing buffer base
-   - `guest_perms: *const u8` (offset 200) — permission table base
+2. **R15 = guest memory base**: JitContext is at `R15 - 4096` (negative
+   offset). Permission table at `R15 - 1052672`. Guest address N is at
+   `[R15 + N]` — single instruction, matching polkavm.
 
-3. **Codegen changes** — for each load/store instruction:
-   - Emit inline permission check + direct memory access (fast path)
-   - Emit jump to page-fault exit (cold path)
-   - Remove helper function calls for loads/stores
+3. **RCX freed as second scratch**: phi[12] spilled to context memory,
+   freeing RCX for the permission check without push/pop overhead.
 
-4. **Permission encoding** — one byte per page:
-   - `0x00` = inaccessible
-   - `0x01` = read-only
-   - `0x03` = read-write
-   - (bit 0 = readable, bit 1 = writable)
+4. **Permission encoding**: `0x00`=inaccessible, `0x01`=read-only,
+   `0x02`=read-write. Checked via `cmp byte [R15 + page_idx - offset], min`.
 
-5. **Cross-page access handling** — PVM allows unaligned cross-page reads.
-   The inline fast path can check `(addr & 0xFFF) + size <= 0x1000` to detect
-   same-page accesses (common case). Cross-page accesses fall back to a
-   helper.
+5. **Cross-page handling**: Skipped on the fast path (flat buffer is
+   contiguous, so cross-page loads/stores work at the hardware level).
+   Permission checked for the first byte's page only — minor spec deviation
+   at page boundaries.
+
+6. **BTreeMap bypassed**: Host-call memory access uses `read_byte`/
+   `write_byte` methods that go directly to the flat buffer. The BTreeMap
+   `Memory` is only synced lazily when `memory()` is explicitly called
+   (debugging/compare mode).
 
 ### Cost Summary
 
-| Approach | Per-access cost | Portability | Complexity |
-|----------|----------------|-------------|------------|
-| Current (BTreeMap helper) | ~25 insn + O(log n) | Everywhere | Low |
-| Option A (flat + inline) | ~6 insn + O(1) | Everywhere | Medium |
-| Option B (signal handler) | ~1 insn | Fragile | High |
-| PolkaVM (separate process) | ~1 insn | Containers broken | Very high |
+| Approach | Per-access cost | Portability | Status |
+|----------|----------------|-------------|--------|
+| BTreeMap helper (original) | ~25 insn + O(log n) | Everywhere | Replaced |
+| **Option A (flat + inline)** | **~5 insn + O(1)** | **Everywhere** | **✅ Deployed** |
+| Option B (signal handler) | ~1 insn | Fragile | Not recommended |
+| PolkaVM (separate process) | ~1 insn | Containers broken | N/A |
 
-Option A is the sweet spot: 4-8x faster than the current approach on memory
-accesses, works everywhere, and keeps the safety invariant that the JIT
-compiler fully controls what memory instructions are emitted.
+Option A delivered a 71x improvement on memory-heavy workloads (sort benchmark).
+The remaining 1.94x gap to polkavm is from the software permission check
+(3 instructions) which can only be eliminated by PVM spec changes (contiguous
+linear memory model — see `pvm-redesign.md`).
 
 ## Summary
 
@@ -407,6 +409,6 @@ Our recompiler's in-process model is not a security compromise — it's a
 **deliberate architectural choice** that trades OS-level isolation (which
 polkavm proves is fragile in practice) for portability, determinism, and
 simplicity. The flat-buffer approach closes the memory-access performance gap
-to within ~6x of polkavm's direct mapping, while preserving the property
+to within **1.94x** of polkavm's direct mapping, while preserving the property
 that **all guest memory accesses are compiler-controlled** — the JIT never
-emits raw addresses from guest registers without adding the buffer base.
+emits raw addresses from guest registers without adding R15 (the buffer base).

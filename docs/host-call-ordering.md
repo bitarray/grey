@@ -126,6 +126,6 @@ The following host calls were audited for the same pattern:
 
 ## Impact
 
-- Blocks affected: 64-67 (4 blocks recovered)
-- Total conformance: 63/101 → 68/101 blocks passing
-- Next failure: block 68 (uninvestigated, different root cause)
+- Blocks affected: 64-67 (4 blocks recovered at time of writing)
+- Conformance after this fix: 63/101 → 68/101 blocks passing
+- All subsequent issues were also fixed — final conformance: **101/101 blocks passing**

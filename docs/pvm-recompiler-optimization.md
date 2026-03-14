@@ -247,18 +247,18 @@ scanning at minimum, and may hit the kernel.
 
 ## Disassembly Comparison
 
-### Grey fib hot loop (final, 35 bytes)
+### Grey fib hot loop (37 bytes)
 
 ```asm
-sub qword [r15+0x68], 5       ; 11 bytes: gas -= 5
-js  oog_stub                   ;  6 bytes: OOG (never taken)
+sub qword [r15-0xf98], 5      ; 11 bytes: gas -= 5
+js  oog_stub                   ;  6 bytes: OOG (forward, always rel32)
 mov rsi, r12                   ;  3 bytes: temp = prev
 add r13, rsi                   ;  3 bytes: temp += curr
 mov r12, r13                   ;  3 bytes: prev = curr
 mov rsi, r13                   ;  3 bytes: curr = temp
 inc r14                        ;  3 bytes: counter++
 cmp r14, rdi                   ;  3 bytes: counter < N?
-jb  loop_start                 ;  6 bytes: back-edge (rel32)
+jb  loop_start                 ;  2 bytes: back-edge (rel8, short jump!)
 ```
 
 ### PolkaVM fib hot loop (33 bytes)
@@ -275,15 +275,17 @@ cmp r12, r9                    ;  3 bytes: counter < N?
 jb  loop_start                 ;  2 bytes: back-edge (rel8)
 ```
 
-The 2-byte difference is entirely from jump encoding: grey uses rel32 (6 bytes)
-while polkavm uses rel8 (2 bytes) for both the OOG branch and the loop
-back-edge. See "Future: Short jumps" below.
+The 4-byte difference is from the forward OOG jump: grey uses rel32 (6 bytes)
+because the OOG stub is far away (forward jump, distance unknown at emit time).
+polkavm uses rel8 (2 bytes) — likely because polkavm emits the OOG stub
+inline (close to the check) rather than as cold code at the end. The back-edge
+`jb` is now rel8 in both.
 
 ## What polkavm Does Differently
 
-1. **Two-pass assembly with short jumps**: polkavm's assembler resolves labels
-   in two passes, using rel8 (2-byte) encoding for jumps within +/-127 bytes.
-   This saves 4 bytes per jump in tight loops.
+1. **Single-pass short jumps for backward branches**: polkavm checks if a
+   label is already bound (backward jump) and emits rel8 if it fits within
+   +/-127 bytes. Forward jumps always use rel32. We now do the same.
 2. **Shared engine with pre-allocated code memory**: The `Engine` object manages
    a memory pool for JIT code. Grey allocates fresh `mmap` pages per compilation.
 3. **Module caching**: polkavm separates `Module` (compiled) from `Instance`
@@ -338,25 +340,26 @@ from the context:
 
 ## Future Optimization Opportunities
 
-### Short jumps (rel8 encoding)
+### Short jumps (rel8 encoding) — ✅ DONE
 
-The biggest remaining code size gap vs polkavm. Currently all jumps use rel32
-(6 bytes for `jcc`, 5 bytes for `jmp`). For jumps within +/-127 bytes, rel8
-encoding saves 4 bytes per jump (2 bytes for `jcc`, 2 bytes for `jmp`).
+Backward jumps within ±127 bytes now use rel8 encoding (2 bytes instead of 6).
+Single-pass: when emitting a branch, check if the label is already bound;
+if so and the distance fits in rel8, emit the short form. No two-pass needed.
+Forward jumps always use rel32 since the target distance is unknown.
 
-**Implementation approach — two-pass assembly**:
-1. First pass: emit all code with rel32 placeholders, record jump sites
-2. Measure all jump distances; identify which fit in rel8
-3. Re-emit with short encodings for qualifying jumps, re-resolve all labels
+The remaining 4-byte gap vs polkavm on the fib hot loop is the forward OOG
+branch (`js oog_stub`) which must be rel32 because the OOG stub is cold code
+at the end of the function.
 
-Alternatively, a **pessimistic shrinking** approach: emit rel32, then
-post-process to shrink qualifying jumps (shifting subsequent code and
-re-resolving fixups). More complex but avoids a full re-emit.
+### Inline memory access — ✅ DONE
 
-**Expected impact**: ~4 bytes saved per qualifying jump. The fib loop has 2
-jumps, so 8 bytes saved (35 -> 27 bytes). Performance impact is likely small
-since we're already ahead of polkavm, but it helps for larger programs with
-many small loops where icache pressure matters.
+Replaced all helper-function-based memory access with inline code:
+- **4GB flat buffer** mapped at R15 (guest address N = `[R15 + N]`)
+- **1MB permission table** at fixed negative offset from R15
+- **RCX freed as second scratch** by spilling phi[12] to context memory
+- Fast path: 5-6 x86 instructions per access (perm check + direct load/store)
+- Sort benchmark: 60ms → 846µs (71x improvement)
+- Remaining gap to polkavm (1.94x) is from the software permission check
 
 ### Module caching
 
@@ -372,32 +375,15 @@ need a cache keyed by content hash.
 
 For common host calls (e.g., `gas`, `lookup`), inlining the dispatch in
 generated code would eliminate the exit/re-entry overhead. This is most
-impactful for the hostcall benchmark where grey already dominates (4.9x faster
+impactful for the hostcall benchmark where grey already dominates (5.1x faster
 than polkavm) due to lighter exit/re-entry machinery.
-
-### Inline memory access fast path
-
-Currently, all memory loads/stores call out to helper functions that validate
-page permissions and handle page faults. For hot memory accesses, inlining the
-access with a fast-path permission check would eliminate function call overhead:
-
-```asm
-; Fast path: check page is mapped and writable
-mov rax, addr >> 12             ; page index
-test byte [page_table + rax], WRITE_BIT
-jz  slow_path                   ; call helper for faults
-mov [memory_base + addr], val   ; direct store
-jmp done
-slow_path:
-  call mem_write_helper
-done:
-```
 
 ### Partial register save/restore
 
-On ecalli exit, all 13 PVM registers are stored to the context, and on re-entry
-all 13 are loaded back. A liveness analysis could identify which registers are
-actually live across the host call and only save/restore those.
+On ecalli exit, all 12 live PVM registers (phi[12] is spilled) are stored to
+the context, and on re-entry all 12 are loaded back. A liveness analysis could
+identify which registers are actually live across the host call and only
+save/restore those.
 
 ### SIMD for bulk memory operations
 
