@@ -392,25 +392,19 @@ fn process_preimages(
                 }
             }
 
-            // Y validity check: preimage_info entry must exist with empty timeslots (= requested)
-            let is_requested = account
-                .preimage_info
-                .get(&key)
-                .map_or(false, |ts| ts.is_empty());
-
-            if !is_requested {
-                // Disregard preimages that weren't solicited or are already provided
-                continue;
-            }
+            // GP eq 12.35: preimage_info entry must exist (solicited)
+            let timeslots = match account.preimage_info.get(&key) {
+                Some(ts) => ts.clone(),
+                None => continue, // Not solicited; ignore
+            };
 
             // Store the preimage blob: d'[s].p[H(i)] = i
             account.preimage_lookup.insert(hash, data.clone());
 
-            // Set timeslots to [τ']: d'[s].l[(H(i), |i|)] = [τ']
-            account.preimage_info.insert(key, vec![current_timeslot]);
-
-            // items (a_i) and footprint (a_o) don't change: the preimage_info entry
-            // already existed (same |l| and K(l)), only its timeslots changed.
+            // Append current timeslot: d'[s].l[(H(i), |i|)] = ts ++ [τ']
+            let mut new_ts = timeslots;
+            new_ts.push(current_timeslot);
+            account.preimage_info.insert(key, new_ts);
         }
     }
 }

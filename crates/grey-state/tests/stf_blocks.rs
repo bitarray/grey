@@ -317,6 +317,35 @@ fn run_independent_trace(trace_name: &str) {
                         "{stem}: state root mismatch: computed={} expected={}",
                         computed_root, expected_root
                     );
+                    // Detailed KV comparison for first failure only
+                    if failed == 0 {
+                        if let Some(expected_kvs_json) = output_json["post_state"].get("keyvals") {
+                            let expected_kvs = parse_keyvals(expected_kvs_json);
+                            let exp_map: std::collections::BTreeMap<[u8; 31], Vec<u8>> =
+                                expected_kvs.iter().cloned().collect();
+                            let act_map: std::collections::BTreeMap<[u8; 31], Vec<u8>> =
+                                output_kvs.iter().cloned().collect();
+                            for (k, ev) in &exp_map {
+                                match act_map.get(k) {
+                                    Some(av) if av != ev => {
+                                        eprintln!("  DIFF key[0]={} key={}...: exp={}B act={}B",
+                                            k[0], hex::encode(&k[..8]), ev.len(), av.len());
+                                    }
+                                    None => {
+                                        eprintln!("  MISSING key[0]={} key={}...: exp={}B",
+                                            k[0], hex::encode(&k[..8]), ev.len());
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            for (k, av) in &act_map {
+                                if !exp_map.contains_key(k) {
+                                    eprintln!("  EXTRA key[0]={} key={}...: act={}B",
+                                        k[0], hex::encode(&k[..8]), av.len());
+                                }
+                            }
+                        }
+                    }
                     failed += 1;
                 }
             }
