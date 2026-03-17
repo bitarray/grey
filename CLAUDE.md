@@ -234,14 +234,14 @@ crates/
 | preimages | 100 | 100/100 |
 | preimages_light | 100 | 100/100 |
 | fuzzy_light | 200 | 198/200 |
-| fuzzy | 200 | 186/200 |
+| fuzzy | 200 | 188/200 |
 | conformance_no_forks | 100 | 100/100 |
 | conformance_forks | 100 | 32/32 non-error |
 
-**8/10 traces fully pass. 1184/1200 blocks pass (98.7%).** Remaining 16 failures are in fuzzy traces.
+**8/10 traces fully pass. 1186/1200 blocks pass (98.8%).** Remaining 14 failures are in fuzzy traces.
 
 ### Known Issues
-- 16 fuzzy trace blocks fail (14 fuzzy + 2 fuzzy_light): Privilege state diffs where the `bless` host call or privilege propagation through accseq multi-round accumulation produces different results. Root cause investigation ongoing.
+- 14 fuzzy trace blocks fail (12 fuzzy + 2 fuzzy_light): Gas accounting differences in edge cases where PVM runs out of gas during multi-round accumulation. The manager service's execution diverges slightly, causing different privilege state.
 - PVM basic-block gas metering temporarily disabled (off-by-one when entering at non-zero PC). Uses per-instruction stepping mode.
 
 ### What's Next
