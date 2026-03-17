@@ -1987,9 +1987,9 @@ fn accumulate_batch(
     let mut batch_auth_queues: Option<BTreeMap<u16, (Vec<Hash>, ServiceId)>> = None;
     let mut batch_pending_validators: Option<Vec<Vec<u8>>> = None;
 
-    // Save initial assign for R merge: if bless changed assign[c], bless wins over assign.
-    let initial_assign = privileges.assign.clone();
-
+    // Save initial privileges for R-merge
+    let initial_privileges = privileges.clone();
+    let mut per_service_privs: BTreeMap<ServiceId, AccPrivileges> = BTreeMap::new();
 
     for &sid in &involved {
         let prev_designate = current_privileges.designate;
@@ -2024,34 +2024,62 @@ fn accumulate_batch(
             batch_pending_validators = result.pending_validators;
         }
 
-        // GP R-merge: only the MANAGER service's bless call updates privileges.
-        // Other services' bless calls are discarded.
-        if sid == current_privileges.bless {
-            current_privileges = result.privileges;
-        }
+        // Track per-service privilege snapshots for R-merge
+        per_service_privs.insert(sid, result.privileges.clone());
+
+        // Sequential privilege propagation (for subsequent services in this batch)
+        current_privileges = result.privileges;
 
         if let Some(output) = result.output {
             outputs.push((sid, output));
         }
     }
 
-    // Apply R merge for assign's assigner SID update:
-    // GP: a'_c = R(a_c, (e*_a)_c, ((Δ(a_c)_e)_a)_c)
-    // R(o, a, b) = b if a = o, else a
-    // If bless changed assign[c] (current != initial), keep bless's value.
-    // If only assign changed it, use assign's new assigner.
-    if let Some(ref aq) = batch_auth_queues {
-        for (&core, &(_, new_assigner)) in aq {
-            let c = core as usize;
-            if c < current_privileges.assign.len() && c < initial_assign.len() {
-                if current_privileges.assign[c] == initial_assign[c] {
-                    // Bless didn't change this core's assigner → use assign's value
-                    current_privileges.assign[c] = new_assigner;
-                }
-                // else: bless changed it → keep bless's value (R merge: manager wins)
-            }
-        }
+    // GP R-merge: R(o, a, b) = b if a == o, else a
+    // o = original, a = manager's result, b = designated service's result
+    let priv_r = |o: ServiceId, a: ServiceId, b: ServiceId| -> ServiceId {
+        if a == o { b } else { a }
+    };
+
+    let delta_priv = |s: ServiceId| -> &AccPrivileges {
+        per_service_privs.get(&s).unwrap_or(&initial_privileges)
+    };
+
+    let m = initial_privileges.bless;  // original manager
+    let v = initial_privileges.designate;  // original designator
+    let r = initial_privileges.register;  // original registrar
+
+    let e_star = delta_priv(m);  // manager's result
+
+    // m' = e*_m (manager from manager's result)
+    let m_prime = e_star.bless;
+    // z' = e*_z (always_acc from manager's result)
+    let z_prime = e_star.always_acc.clone();
+
+    // a'_c = R(a_c, e*_a_c, Delta(a_c)_a_c)
+    let mut a_prime = initial_privileges.assign.clone();
+    for (c, a_c) in initial_privileges.assign.iter().enumerate() {
+        let e_star_ac = e_star.assign.get(c).copied().unwrap_or(*a_c);
+        let delta_ac = delta_priv(*a_c);
+        let delta_ac_ac = delta_ac.assign.get(c).copied().unwrap_or(*a_c);
+        a_prime[c] = priv_r(*a_c, e_star_ac, delta_ac_ac);
     }
+
+    // v' = R(v, e*_v, Delta(v)_v)
+    let delta_v = delta_priv(v);
+    let v_prime = priv_r(v, e_star.designate, delta_v.designate);
+
+    // r' = R(r, e*_r, Delta(r)_r)
+    let delta_r = delta_priv(r);
+    let r_prime = priv_r(r, e_star.register, delta_r.register);
+
+    current_privileges = AccPrivileges {
+        bless: m_prime,
+        assign: a_prime,
+        designate: v_prime,
+        register: r_prime,
+        always_acc: z_prime,
+    };
 
     (
         current_accounts,
