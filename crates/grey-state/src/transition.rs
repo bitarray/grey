@@ -56,6 +56,7 @@ pub fn apply_with_config(state: &State, block: &Block, config: &Config, opaque_d
     // Step 5: Process availability assurances (Section 11.2)
     let available_reports = process_assurances(&mut new_state, &extrinsic.assurances, header.timeslot, config);
 
+
     // Step 6: Process work report guarantees (Section 11.4)
     // Collect incoming reports (I) before processing guarantees
     let incoming_reports: Vec<&grey_types::work::WorkReport> = extrinsic.guarantees.iter().map(|g| &g.report).collect();

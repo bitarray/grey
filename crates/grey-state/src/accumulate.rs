@@ -506,16 +506,18 @@ fn encode_operand(
     buf.extend_from_slice(&report.authorizer_hash.0);           // a: 32 bytes
     buf.extend_from_slice(&digest.payload_hash.0);              // y: 32 bytes
     grey_codec::encode::encode_natural(digest.accumulate_gas as usize, &mut buf); // g: varint
-    // O(xl) - result encoding
+    // O(xl) - result encoding (GP C.5: discriminated union)
     match &digest.result {
         WorkResult::Ok(data) => {
-            buf.push(0); // success discriminator
-            grey_codec::encode::encode_natural(data.len(), &mut buf); // length prefix
+            buf.push(0);
+            grey_codec::encode::encode_natural(data.len(), &mut buf);
             buf.extend_from_slice(data);
         }
-        _ => {
-            buf.push(2); // panic discriminator
-        }
+        WorkResult::OutOfGas => buf.push(1),
+        WorkResult::Panic => buf.push(2),
+        WorkResult::BadExports => buf.push(3),
+        WorkResult::BadCode => buf.push(4),
+        WorkResult::CodeOversize => buf.push(5),
     }
     // ↕xt - length-prefixed authorizer trace
     grey_codec::encode::encode_natural(report.auth_output.len(), &mut buf);
@@ -1979,6 +1981,7 @@ fn accumulate_batch(
     // Save initial assign for R merge: if bless changed assign[c], bless wins over assign.
     let initial_assign = privileges.assign.clone();
 
+
     for &sid in &involved {
         let prev_designate = current_privileges.designate;
         let prev_bless = current_privileges.bless;
@@ -2078,7 +2081,8 @@ fn accumulate_all(
     Option<BTreeMap<u16, (Vec<Hash>, ServiceId)>>,
     Option<Vec<Vec<u8>>>,
 ) {
-    // Find max reports that fit in gas budget (i in GP)
+    // Include all reports that fit in gas budget.
+    // GP: i is the maximum index such that Σ g_d for reports[..i] ≤ g.
     let mut gas_sum: Gas = 0;
     let mut max_reports = 0;
     for report in reports {
