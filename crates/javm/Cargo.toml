@@ -1,8 +1,9 @@
 [package]
 name = "javm"
-version.workspace = true
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 description = "Join-Accumulate VM (JAVM)."
 
 [dependencies]
