@@ -240,12 +240,7 @@ crates/
 
 **10/10 traces fully pass. 1200/1200 blocks pass (100%).**
 
-### Known Issues
-- PVM basic-block gas metering temporarily disabled (off-by-one when entering at non-zero PC). Uses per-instruction stepping mode.
-
 ### What's Next
-- Fix remaining 16 fuzzy trace failures
-- Re-enable optimized basic-block gas metering
 - P2P networking layer in `grey-network`
 
 ## Development Guidelines

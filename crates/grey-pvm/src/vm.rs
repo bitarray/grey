@@ -1438,18 +1438,13 @@ impl Pvm {
 
     /// Run the machine until it exits (eq A.1).
     ///
-    /// Uses pre-decoded instructions with basic-block gas charging for speed.
+    /// Uses pre-decoded instructions for speed (avoids per-instruction decode overhead).
+    /// Gas is charged per-instruction (1 gas each, matching the stepping path exactly).
     /// Returns (exit_reason, gas_used).
     pub fn run(&mut self) -> (ExitReason, Gas) {
         let initial_gas = self.gas;
 
-        // Use step-by-step path: basic-block gas metering has an off-by-one
-        // when entering at a non-zero PC (e.g., pc=5 for accumulation).
-        // TODO: Fix basic-block metering to handle mid-block entry correctly.
-        return self.run_stepping(initial_gas);
-
         // If tracing is enabled, fall back to the slow step-by-step path
-        #[allow(unreachable_code)]
         if self.tracing_enabled {
             return self.run_stepping(initial_gas);
         }
@@ -1471,14 +1466,12 @@ impl Pvm {
             // Copy the decoded instruction (avoids borrow conflict with &mut self)
             let inst = *unsafe { self.decoded_insts.get_unchecked(idx as usize) };
 
-            // Basic-block gas charging: charge once at block entry
-            if inst.bb_gas_cost > 0 {
-                if self.gas < inst.bb_gas_cost {
-                    self.pc = inst.pc;
-                    return (ExitReason::OutOfGas, initial_gas - self.gas);
-                }
-                self.gas -= inst.bb_gas_cost;
+            // Per-instruction gas charging (ϱΔ = 1 per instruction)
+            if self.gas == 0 {
+                self.pc = inst.pc;
+                return (ExitReason::OutOfGas, initial_gas);
             }
+            self.gas -= 1;
 
             // Fast-path execution using flat operands (no Args enum matching).
             let ra = inst.ra as usize;
