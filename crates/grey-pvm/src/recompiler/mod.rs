@@ -541,9 +541,12 @@ impl RecompiledPvm {
         ctx.bb_starts = basic_block_starts.as_ptr() as *const u8;
 
         if debug {
-            eprintln!("  write_u8 fn=0x{:x}", mem_write_u8 as *const () as usize);
-            eprintln!("  write_u32 fn=0x{:x}", mem_write_u32 as *const () as usize);
-            eprintln!("  read_u8 fn=0x{:x}", mem_read_u8 as *const () as usize);
+            tracing::debug!(
+                write_u8 = format_args!("0x{:x}", mem_write_u8 as *const () as usize),
+                write_u32 = format_args!("0x{:x}", mem_write_u32 as *const () as usize),
+                read_u8 = format_args!("0x{:x}", mem_read_u8 as *const () as usize),
+                "recompiler helper function pointers"
+            );
         }
 
         // Compile
@@ -569,8 +572,11 @@ impl RecompiledPvm {
 
         if debug {
             let _ = std::fs::write("/tmp/pvm_native.bin", &native);
-            eprintln!("Wrote {} bytes of native code to /tmp/pvm_native.bin", native.len());
-            eprintln!("  basic_block_starts count: {}", basic_block_starts.iter().filter(|&&b| b).count());
+            tracing::debug!(
+                native_bytes = native.len(),
+                basic_blocks = basic_block_starts.iter().filter(|&&b| b).count(),
+                "wrote native code to /tmp/pvm_native.bin"
+            );
         }
 
         let native_code = NativeCode::new(&native)?;
@@ -613,9 +619,14 @@ impl RecompiledPvm {
     pub fn run(&mut self) -> ExitReason {
         loop {
             if self.debug {
-                eprintln!("recompiler::run() entry_pc={} gas={} heap_base=0x{:08x} heap_top=0x{:08x}",
-                    self.ctx().entry_pc, self.ctx().gas, self.ctx().heap_base, self.ctx().heap_top);
-                eprintln!("  initial regs: {:?}", &self.ctx().regs);
+                tracing::debug!(
+                    entry_pc = self.ctx().entry_pc,
+                    gas = self.ctx().gas,
+                    heap_base = format_args!("0x{:08x}", self.ctx().heap_base),
+                    heap_top = format_args!("0x{:08x}", self.ctx().heap_top),
+                    regs = ?&self.ctx().regs,
+                    "recompiler::run() entry"
+                );
                 self.ctx_mut().exit_reason = 0xDEAD;
             }
 
@@ -624,9 +635,14 @@ impl RecompiledPvm {
             unsafe { entry(self.ctx); }
 
             if self.debug {
-                eprintln!("recompiler::run() exit_reason={} exit_arg={} gas={} pc={}",
-                    self.ctx().exit_reason, self.ctx().exit_arg, self.ctx().gas, self.ctx().pc);
-                eprintln!("  regs: {:?}", &self.ctx().regs);
+                tracing::debug!(
+                    exit_reason = self.ctx().exit_reason,
+                    exit_arg = self.ctx().exit_arg,
+                    gas = self.ctx().gas,
+                    pc = self.ctx().pc,
+                    regs = ?&self.ctx().regs,
+                    "recompiler::run() exit"
+                );
             }
 
             // Read exit reason from context
