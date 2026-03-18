@@ -1932,8 +1932,8 @@ impl Compiler {
     /// Uses a per-block OOG stub (cold code) to store PC only on the OOG path,
     /// keeping the hot path free of PC stores.
     fn emit_gas_check(&mut self, pc: usize, code: &[u8], bitmask: &[u8]) {
-        // Count instructions in this gas block (until next gas block or terminator)
-        let cost = compute_gas_block_cost(pc, code, bitmask, &self.gas_block_starts);
+        // Pipeline-simulated gas cost (JAR v0.8.0)
+        let cost = crate::gas_cost::gas_cost_for_block(code, bitmask, pc) as u32;
         if cost == 0 { return; }
 
         // sub qword [r15 + CTX_GAS], cost  — sets SF if result < 0

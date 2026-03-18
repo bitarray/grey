@@ -870,27 +870,9 @@ impl RecompiledPvm {
     /// With block-level gas metering, the full block cost is subtracted at block
     /// start. If execution exits mid-block, we've over-charged gas for the
     /// instructions that didn't execute. This adds back the un-executed portion.
-    fn correct_gas_for_mid_block_exit(&mut self, exit_pc: usize) {
-        // Find the gas block containing exit_pc by scanning backwards.
-        let mut block_start = exit_pc;
-        while block_start > 0 {
-            if block_start < self.gas_block_starts.len() && self.gas_block_starts[block_start] {
-                break;
-            }
-            block_start -= 1;
-        }
-
-        // Count instructions from exit_pc+1 to end of gas block (the un-executed tail).
-        let block_cost = codegen::compute_gas_block_cost(
-            block_start, &self.code, &self.bitmask, &self.gas_block_starts,
-        );
-        let executed_cost = codegen::compute_gas_block_cost_up_to(
-            block_start, exit_pc, &self.code, &self.bitmask,
-        );
-        let refund = block_cost.saturating_sub(executed_cost);
-        if refund > 0 {
-            self.ctx_mut().gas += refund as i64;
-        }
+    fn correct_gas_for_mid_block_exit(&mut self, _exit_pc: usize) {
+        // JAR v0.8.0 pipeline gas: the full block cost is always the correct
+        // charge. No refund on mid-block exit (halt, panic, page fault).
     }
 
     fn sync_memory_from_interp(&mut self, memory: &Memory) {
