@@ -22,6 +22,7 @@
 //! Reserved: R15 = JitContext pointer, RDX = scratch, RSP = native stack.
 
 use super::asm::{Assembler, Cc, Label, Reg};
+use super::gas_sim::GasSimulator;
 use super::predecode::PreDecodedInst;
 use crate::args::Args;
 use crate::instruction::Opcode;
@@ -211,11 +212,10 @@ impl Compiler {
             self.label_for_pc(instr.pc);
         }
 
-        // Single-pass compilation: decode → gas sim → codegen integrated.
-        // Gas costs are computed inline and patched into placeholders.
-
-        // Pending gas block: (oog_stub_label, block_start_pc, cost_patch_offset, block_start_idx)
-        let mut pending_gas: Option<(Label, u32, usize, usize)> = None;
+        // Single-pass compilation: gas sim fed inline, cost patched at block boundaries.
+        let mut gas_sim = GasSimulator::new();
+        // Pending gas block: (oog_stub_label, block_start_pc, cost_patch_offset)
+        let mut pending_gas: Option<(Label, u32, usize)> = None;
 
         let mut i = 0;
         while i < instrs.len() {
@@ -227,23 +227,26 @@ impl Compiler {
                 self.asm.bind_label(label);
             }
 
-            // At gas block start: finalize previous block's cost, start new one
+            // At gas block boundary: finalize previous block, start new one
             if instr.is_gas_block_start {
-                // Finalize previous block
-                if let Some((stub_label, block_pc, patch_offset, block_start)) = pending_gas.take() {
-                    let block_instrs = &instrs[block_start..i];
-                    let cost = crate::gas_cost::gas_cost_for_block_fast(block_instrs, raw_code, raw_bitmask) as u32;
+                if let Some((stub_label, block_pc, patch_offset)) = pending_gas.take() {
+                    let cost = gas_sim.flush_and_get_cost();
                     self.asm.patch_i32(patch_offset, cost as i32);
                     self.oog_stubs.push((stub_label, block_pc, cost));
                 }
+                gas_sim.reset();
 
-                // Start new gas block: emit placeholder sub + jcc
+                // Emit placeholder sub + jcc
                 let stub_label = self.asm.new_label();
-                self.asm.sub_mem64_imm32(CTX, CTX_GAS, 0); // placeholder cost=0
-                let patch_offset = self.asm.offset() - 4; // offset of the imm32
+                self.asm.sub_mem64_imm32(CTX, CTX_GAS, 0);
+                let patch_offset = self.asm.offset() - 4;
                 self.asm.jcc_label(Cc::S, stub_label);
-                pending_gas = Some((stub_label, instr.pc, patch_offset, i));
+                pending_gas = Some((stub_label, instr.pc, patch_offset));
             }
+
+            // Feed instruction to gas simulator
+            let fc = crate::gas_cost::fast_cost(instr, raw_code, raw_bitmask);
+            gas_sim.feed(&fc);
 
             // Peephole lookahead: try multi-instruction fusion patterns.
             let fused = match instr.opcode {
@@ -253,6 +256,11 @@ impl Compiler {
             };
 
             if let Some(advance) = fused {
+                // Feed fused instructions to gas sim too
+                for j in 1..advance {
+                    let fc = crate::gas_cost::fast_cost(&instrs[i + j], raw_code, raw_bitmask);
+                    gas_sim.feed(&fc);
+                }
                 i += advance;
                 continue;
             }
@@ -264,9 +272,8 @@ impl Compiler {
         }
 
         // Finalize last gas block
-        if let Some((stub_label, block_pc, patch_offset, block_start)) = pending_gas.take() {
-            let block_instrs = &instrs[block_start..instrs.len()];
-            let cost = crate::gas_cost::gas_cost_for_block_fast(block_instrs, raw_code, raw_bitmask) as u32;
+        if let Some((stub_label, block_pc, patch_offset)) = pending_gas.take() {
+            let cost = gas_sim.flush_and_get_cost();
             self.asm.patch_i32(patch_offset, cost as i32);
             self.oog_stubs.push((stub_label, block_pc, cost));
         }

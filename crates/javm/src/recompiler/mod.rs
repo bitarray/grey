@@ -12,6 +12,7 @@
 
 pub mod asm;
 pub mod codegen;
+pub mod gas_sim;
 pub mod predecode;
 
 use crate::memory::Memory;

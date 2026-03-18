@@ -752,14 +752,14 @@ pub fn compute_block_gas_costs(code: &[u8], bitmask: &[u8]) -> Vec<u64> {
 /// Compact instruction cost for the fast simulator.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FastCost {
-    cycles: u8,
-    decode_slots: u8,
+    pub cycles: u8,
+    pub decode_slots: u8,
     /// 0=none, 1=alu, 2=load(+alu), 3=store(+alu), 4=mul(+alu), 5=div(+alu)
-    exec_unit: u8,
-    src_mask: u16,     // bitmask of source registers (bits 0-12)
-    dst_mask: u16,     // bitmask of dest registers (bits 0-12)
-    is_terminator: bool,
-    is_move_reg: bool,
+    pub exec_unit: u8,
+    pub src_mask: u16,
+    pub dst_mask: u16,
+    pub is_terminator: bool,
+    pub is_move_reg: bool,
 }
 
 const EU_NONE: u8 = 0;
