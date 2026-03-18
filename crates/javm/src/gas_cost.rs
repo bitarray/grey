@@ -366,46 +366,42 @@ fn gas_sim(code: &[u8], bitmask: &[u8], start_pc: usize) -> u32 {
     };
 
     for _ in 0..100_000 {
-        // Priority 1: Decode
+        // Priority 1: Decode (matching Lean: canDecode checks slots > 0, not >= cost)
         if s.ip.is_some() && s.decode_slots > 0 && s.rob.len() < 32 {
             let pc = s.ip.unwrap();
             let cost = instruction_cost(code, bitmask, pc);
 
-            if cost.decode_slots > s.decode_slots {
-                // Not enough decode slots this cycle — advance
+            // Compute dependencies
+            let deps: Vec<usize> = s.rob.iter().enumerate()
+                .filter(|(_, e)| e.state != RobState::Fin
+                    && e.dest_regs.iter().any(|dr| cost.src_regs.contains(dr)))
+                .map(|(i, _)| i)
+                .collect();
+
+            // Saturating subtract (Lean Nat semantics)
+            s.decode_slots = s.decode_slots.saturating_sub(cost.decode_slots);
+
+            let next_ip = if cost.is_terminator {
+                None
             } else {
-                // Compute dependencies
-                let deps: Vec<usize> = s.rob.iter().enumerate()
-                    .filter(|(_, e)| e.state != RobState::Fin
-                        && e.dest_regs.iter().any(|dr| cost.src_regs.contains(dr)))
-                    .map(|(i, _)| i)
-                    .collect();
+                let skip = skip_distance(bitmask, pc);
+                let npc = pc + 1 + skip;
+                if npc < code.len() { Some(npc) } else { None }
+            };
 
-                s.decode_slots -= cost.decode_slots;
-
-                let next_ip = if cost.is_terminator {
-                    None
-                } else {
-                    let skip = skip_distance(bitmask, pc);
-                    let npc = pc + 1 + skip;
-                    if npc < code.len() { Some(npc) } else { None }
-                };
-
-                if cost.is_move_reg {
-                    // Frontend-only: no ROB entry
-                    s.ip = next_ip;
-                } else {
-                    s.rob.push(RobEntry {
-                        state: RobState::Wait,
-                        cycles_left: cost.cycles,
-                        deps,
-                        dest_regs: cost.dest_regs,
-                        exec_units: cost.exec_units,
-                    });
-                    s.ip = next_ip;
-                }
-                continue;
+            if cost.is_move_reg {
+                s.ip = next_ip;
+            } else {
+                s.rob.push(RobEntry {
+                    state: RobState::Wait,
+                    cycles_left: cost.cycles,
+                    deps,
+                    dest_regs: cost.dest_regs,
+                    exec_units: cost.exec_units,
+                });
+                s.ip = next_ip;
             }
+            continue;
         }
 
         // Priority 2: Dispatch
