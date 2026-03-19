@@ -11,7 +11,7 @@
 
 // --- Data structures ---
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, Debug)]
 struct ExecUnits {
     alu: u8,
     load: u8,
@@ -770,7 +770,8 @@ const EU_DIV: u8 = 5;
 
 #[inline(always)]
 fn reg_bit(r: u8) -> u16 {
-    if r < 13 { 1u16 << r } else { 0 }
+    // PVM clamps registers to 0-12; raw nibble 13/14/15 all map to register 12.
+    1u16 << r.min(12)
 }
 
 /// Extract branch target from raw code bytes (for gas cost computation).
@@ -1274,5 +1275,96 @@ mod integration_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn trace_divergent_block() {
+        let blob = match std::fs::read("/tmp/test_service_blob.bin") {
+            Ok(b) => b,
+            Err(_) => { eprintln!("Skipping: /tmp/test_service_blob.bin not found"); return; }
+        };
+        let pvm = crate::program::initialize_program(&blob, &[0,0,0,0], 100_000).unwrap();
+        let code = &pvm.code;
+        let bm = &pvm.bitmask;
+        // Trace PC=79 with gas_sim_traced
+        eprintln!("=== gas_sim_traced PC=79 ===");
+        let cycles = gas_sim_traced(code, bm, 79, true);
+        eprintln!("Result: cycles={} cost={}", cycles, if cycles > 3 { cycles - 3 } else { 1 });
+
+        // Now show instruction-by-instruction FastCost for same block
+        let bb = crate::vm::compute_basic_block_starts(code, bm);
+        eprintln!("\n=== FastCost for same block ===");
+        let mut pc = 79;
+        loop {
+            if pc >= bm.len() || (pc != 79 && pc < bb.len() && bb[pc]) { break; }
+            if bm[pc] != 1 { pc += 1; continue; }
+            let Some(op) = crate::instruction::Opcode::from_byte(code[pc]) else { pc += 1; continue; };
+            let raw_ra = if pc + 1 < code.len() { code[pc + 1] & 0x0F } else { 0 };
+            let raw_rb = if pc + 1 < code.len() { (code[pc + 1] >> 4) & 0x0F } else { 0 };
+            let raw_rd = if pc + 2 < code.len() { code[pc + 2] & 0x0F } else { 0 };
+            let fc = fast_cost_from_raw(op as u8, raw_ra, raw_rb, raw_rd, pc as u32, code, bm);
+            let ic = instruction_cost(code, bm, pc);
+            eprintln!("  pc={} {:?} FC(cy={} dc={} eu={} src={:04x} dst={:04x} term={} mv={}) IC(cy={} dc={} eu={:?} dst={:?} src={:?} term={} mv={})",
+                pc, op, fc.cycles, fc.decode_slots, fc.exec_unit, fc.src_mask, fc.dst_mask, fc.is_terminator, fc.is_move_reg,
+                ic.cycles, ic.decode_slots, ic.exec_units, ic.dest_regs, ic.src_regs, ic.is_terminator, ic.is_move_reg);
+            if op.is_terminator() { break; }
+            let mut skip = 0;
+            for j in 0..25 {
+                if pc + 1 + j >= bm.len() || bm[pc + 1 + j] == 1 { skip = j; break; }
+            }
+            pc += 1 + skip;
+        }
+    }
+
+    #[test]
+    fn compare_gas_sim_vs_gas_simulator() {
+        use crate::recompiler::gas_sim::GasSimulator;
+        let blob = match std::fs::read("/tmp/test_service_blob.bin") {
+            Ok(b) => b,
+            Err(_) => { eprintln!("Skipping: /tmp/test_service_blob.bin not found"); return; }
+        };
+        let pvm = crate::program::initialize_program(&blob, &[0,0,0,0], 100_000).unwrap();
+        let code = &pvm.code;
+        let bm = &pvm.bitmask;
+        let bb = crate::vm::compute_basic_block_starts(code, bm);
+
+        let mut mismatches = 0;
+        let mut total = 0;
+        for start_pc in 0..code.len() {
+            if start_pc >= bb.len() || !bb[start_pc] { continue; }
+            total += 1;
+
+            let old_cost = gas_cost_for_block(code, bm, start_pc);
+
+            // Compute with GasSimulator
+            let mut sim = GasSimulator::new();
+            let mut pc = start_pc;
+            loop {
+                if pc >= bm.len() || (pc != start_pc && pc < bb.len() && bb[pc]) { break; }
+                if bm[pc] != 1 { pc += 1; continue; }
+                let Some(op) = crate::instruction::Opcode::from_byte(code[pc]) else { pc += 1; continue; };
+                let raw_ra = if pc + 1 < code.len() { code[pc + 1] & 0x0F } else { 0 };
+                let raw_rb = if pc + 1 < code.len() { (code[pc + 1] >> 4) & 0x0F } else { 0 };
+                let raw_rd = if pc + 2 < code.len() { code[pc + 2] & 0x0F } else { 0 };
+                let fc = fast_cost_from_raw(op as u8, raw_ra, raw_rb, raw_rd, pc as u32, code, bm);
+                sim.feed(&fc);
+                if op.is_terminator() { break; }
+                let mut skip = 0;
+                for j in 0..25 {
+                    if pc + 1 + j >= bm.len() || bm[pc + 1 + j] == 1 { skip = j; break; }
+                }
+                pc += 1 + skip;
+            }
+            let new_cost = sim.flush_and_get_cost() as u64;
+
+            if old_cost != new_cost {
+                mismatches += 1;
+                if mismatches <= 10 {
+                    eprintln!("MISMATCH PC={}: gas_sim_traced={} GasSimulator={}", start_pc, old_cost, new_cost);
+                }
+            }
+        }
+        eprintln!("Total blocks: {}, mismatches: {}", total, mismatches);
+        assert_eq!(mismatches, 0, "{} gas cost mismatches between gas_sim_traced and GasSimulator", mismatches);
     }
 }
