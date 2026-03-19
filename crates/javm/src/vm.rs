@@ -134,35 +134,35 @@ impl Pvm {
 
     // --- Flat memory accessors ---
 
-    #[inline(always)]
+    #[inline]
     pub fn read_u8(&self, addr: u32) -> Option<u8> {
         self.flat_mem.get(addr as usize).copied()
     }
 
-    #[inline(always)]
+    #[inline]
     fn read_u16_le(&self, addr: u32) -> Option<u16> {
         let a = addr as usize;
         self.flat_mem.get(a..a + 2).map(|s| u16::from_le_bytes(s.try_into().unwrap()))
     }
 
-    #[inline(always)]
+    #[inline]
     fn read_u32_le(&self, addr: u32) -> Option<u32> {
         let a = addr as usize;
         self.flat_mem.get(a..a + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap()))
     }
 
-    #[inline(always)]
+    #[inline]
     fn read_u64_le(&self, addr: u32) -> Option<u64> {
         let a = addr as usize;
         self.flat_mem.get(a..a + 8).map(|s| u64::from_le_bytes(s.try_into().unwrap()))
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn write_u8(&mut self, addr: u32, val: u8) -> bool {
         if let Some(b) = self.flat_mem.get_mut(addr as usize) { *b = val; true } else { false }
     }
 
-    #[inline(always)]
+    #[inline]
     fn write_u16_le(&mut self, addr: u32, val: u16) -> bool {
         let a = addr as usize;
         if let Some(s) = self.flat_mem.get_mut(a..a + 2) {
@@ -170,7 +170,7 @@ impl Pvm {
         } else { false }
     }
 
-    #[inline(always)]
+    #[inline]
     fn write_u32_le(&mut self, addr: u32, val: u32) -> bool {
         let a = addr as usize;
         if let Some(s) = self.flat_mem.get_mut(a..a + 4) {
@@ -178,7 +178,7 @@ impl Pvm {
         } else { false }
     }
 
-    #[inline(always)]
+    #[inline]
     fn write_u64_le(&mut self, addr: u32, val: u64) -> bool {
         let a = addr as usize;
         if let Some(s) = self.flat_mem.get_mut(a..a + 8) {
@@ -311,6 +311,8 @@ impl Pvm {
     }
 
     /// Execute a decoded instruction. Returns exit reason if halting.
+    #[cold]
+    #[inline(never)]
     fn execute(&mut self, opcode: Opcode, args: Args, next_pc: u32) -> Option<ExitReason> {
         match opcode {
             // === A.5.1: No arguments ===
