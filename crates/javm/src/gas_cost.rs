@@ -39,6 +39,14 @@ impl ExecUnits {
     const MUL: ExecUnits = ExecUnits { alu: 1, load: 0, store: 0, mul: 1, div: 0 };
     const DIV: ExecUnits = ExecUnits { alu: 1, load: 0, store: 0, mul: 0, div: 1 };
     const NONE: ExecUnits = ExecUnits { alu: 0, load: 0, store: 0, mul: 0, div: 0 };
+    fn to_eu_byte(self) -> u8 {
+        if self.div > 0 { 5 }
+        else if self.mul > 0 { 4 }
+        else if self.store > 0 { 3 }
+        else if self.load > 0 { 2 }
+        else if self.alu > 0 { 1 }
+        else { 0 }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1357,14 +1365,46 @@ mod integration_tests {
             }
             let new_cost = sim.flush_and_get_cost() as u64;
 
-            if old_cost != new_cost {
+            // Also run GasSimulator with instruction_cost data (to isolate sim vs cost issue)
+            let mut sim2 = GasSimulator::new();
+            let mut pc2 = start_pc;
+            loop {
+                if pc2 >= bm.len() || (pc2 != start_pc && pc2 < bb.len() && bb[pc2]) { break; }
+                if bm[pc2] != 1 { pc2 += 1; continue; }
+                let Some(op) = crate::instruction::Opcode::from_byte(code[pc2]) else { pc2 += 1; continue; };
+                let ic = instruction_cost(code, bm, pc2);
+                // Convert InstrCost to FastCost
+                let mut src_mask: u16 = 0;
+                for i in 0..ic.src_regs.len as usize { src_mask |= reg_bit(ic.src_regs.regs[i]); }
+                let mut dst_mask: u16 = 0;
+                for i in 0..ic.dest_regs.len as usize { dst_mask |= reg_bit(ic.dest_regs.regs[i]); }
+                let fc2 = FastCost {
+                    cycles: ic.cycles as u8,
+                    decode_slots: ic.decode_slots,
+                    exec_unit: ic.exec_units.to_eu_byte(),
+                    src_mask,
+                    dst_mask,
+                    is_terminator: ic.is_terminator,
+                    is_move_reg: ic.is_move_reg,
+                };
+                sim2.feed(&fc2);
+                if op.is_terminator() { break; }
+                let mut skip = 0;
+                for j in 0..25 {
+                    if pc2 + 1 + j >= bm.len() || bm[pc2 + 1 + j] == 1 { skip = j; break; }
+                }
+                pc2 += 1 + skip;
+            }
+            let ic_cost = sim2.flush_and_get_cost() as u64;
+
+            if old_cost != new_cost || old_cost != ic_cost {
                 mismatches += 1;
                 if mismatches <= 10 {
-                    eprintln!("MISMATCH PC={}: gas_sim_traced={} GasSimulator={}", start_pc, old_cost, new_cost);
+                    eprintln!("MISMATCH PC={}: gas_sim_traced={} GasSim+FC={} GasSim+IC={}", start_pc, old_cost, new_cost, ic_cost);
                 }
             }
         }
         eprintln!("Total blocks: {}, mismatches: {}", total, mismatches);
-        assert_eq!(mismatches, 0, "{} gas cost mismatches between gas_sim_traced and GasSimulator", mismatches);
+        assert_eq!(mismatches, 0, "{} gas cost mismatches", mismatches);
     }
 }

@@ -1,285 +1,212 @@
-//! Single-pass gas pipeline simulator with fast-forward optimization.
+//! Pipeline gas simulator (JAR v0.8.0).
 //!
 //! Simulates a CPU pipeline (32-entry ROB, 4 decode/5 dispatch slots per cycle)
-//! to compute per-basic-block gas costs. Designed to be fed one instruction at a
-//! time during codegen, producing a block cost at each block boundary.
+//! to compute per-basic-block gas costs. Collects instructions via feed(),
+//! then simulates the pipeline in flush_and_get_cost().
 //!
-//! The key optimization over the batch `gas_sim_fast()` is **fast-forward**:
-//! when the pipeline stalls waiting for a long-latency op (e.g. 25-cycle load),
-//! we skip directly to the next completion event instead of ticking one cycle
-//! at a time.
-//!
-//! Platform support:
-//! - x86-64 AVX2: SIMD bulk subtract + compare for cycle advance
-//! - All platforms: scalar bitmask iteration fallback
+//! This is a stack-allocated, zero-heap replacement for gas_cost::gas_sim_traced()
+//! that produces identical results.
 
 use crate::gas_cost::FastCost;
 
-const EU_NONE: u8 = 0;
-const EU_ALU: u8 = 1;
-const EU_LOAD: u8 = 2;
-const EU_STORE: u8 = 3;
-const EU_MUL: u8 = 4;
-const EU_DIV: u8 = 5;
+const MAX_INSTRS: usize = 32;
+
+/// Collected instruction for simulation.
+#[derive(Clone, Copy)]
+struct Instr {
+    cycles: u8,
+    decode_slots: u8,
+    exec_unit: u8,
+    src_mask: u16,
+    dst_mask: u16,
+    is_move_reg: bool,
+}
+
+/// ROB entry state.
+#[derive(Clone, Copy, PartialEq)]
+enum State { Wait, Exe, Fin }
 
 /// Single-pass pipeline gas simulator. Stack-allocated, zero heap allocation.
 pub struct GasSimulator {
-    // 32-entry SoA ROB
-    cycles_left: [u8; 32],
-    exec_unit: [u8; 32],
-    deps: [u32; 32],
-    reg_writer: [u8; 16], // per-register: ROB slot index, 0xFF = none
-
-    // Bitmask state tracking
-    wait_mask: u32,
-    exe_mask: u32,
-    fin_mask: u32,
-
-    next_slot: u8,
-    cycles: u32,
-    decode_slots: u8,
-    dispatch_slots: u8,
-    eu_avail: [u8; 5], // alu, load, store, mul, div
+    instrs: [Instr; MAX_INSTRS],
+    count: usize,
 }
 
 impl GasSimulator {
     pub fn new() -> Self {
         Self {
-            cycles_left: [0; 32],
-            exec_unit: [0; 32],
-            deps: [0; 32],
-            reg_writer: [0xFF; 16],
-            wait_mask: 0,
-            exe_mask: 0,
-            fin_mask: 0,
-            next_slot: 0,
-            cycles: 0,
-            decode_slots: 4,
-            dispatch_slots: 5,
-            eu_avail: [4, 4, 4, 1, 1],
+            instrs: [Instr { cycles: 0, decode_slots: 0, exec_unit: 0, src_mask: 0, dst_mask: 0, is_move_reg: false }; MAX_INSTRS],
+            count: 0,
         }
     }
 
-    /// Feed one instruction into the pipeline. Advances cycles as needed.
+    /// Collect one instruction. Call flush_and_get_cost() at block boundary.
     #[inline]
     pub fn feed(&mut self, cost: &FastCost) {
-        if cost.is_move_reg {
-            // move_reg: no ROB entry, just consume decode slots
-            self.decode_slots = self.decode_slots.saturating_sub(cost.decode_slots);
-            return;
+        if self.count < MAX_INSTRS {
+            self.instrs[self.count] = Instr {
+                cycles: cost.cycles,
+                decode_slots: cost.decode_slots,
+                exec_unit: cost.exec_unit,
+                src_mask: cost.src_mask,
+                dst_mask: cost.dst_mask,
+                is_move_reg: cost.is_move_reg,
+            };
+            self.count += 1;
         }
-
-        // ROB full (32 entries used) — stop simulating (matches old behavior)
-        if (self.next_slot as usize) >= 32 {
-            return;
-        }
-
-        // Wait for decode slots if needed
-        while self.decode_slots < cost.decode_slots {
-            self.dispatch_all();
-            if self.decode_slots >= cost.decode_slots { break; }
-            if self.exe_mask != 0 {
-                self.tick_fast_forward();
-            } else {
-                self.advance_one_cycle();
-            }
-        }
-
-        // Build dependency mask
-        let mut dep_mask: u32 = 0;
-        let mut src = cost.src_mask;
-        while src != 0 {
-            let reg = src.trailing_zeros() as usize;
-            src &= src - 1;
-            let writer = self.reg_writer[reg];
-            if writer != 0xFF && (self.fin_mask & (1u32 << writer)) == 0 {
-                dep_mask |= 1u32 << writer;
-            }
-        }
-
-        // Insert into ROB
-        let slot = self.next_slot as usize;
-        self.cycles_left[slot] = cost.cycles;
-        self.exec_unit[slot] = cost.exec_unit;
-        self.deps[slot] = dep_mask;
-        self.wait_mask |= 1u32 << slot;
-
-        // Update register writers
-        let mut dst = cost.dst_mask;
-        while dst != 0 {
-            let reg = dst.trailing_zeros() as usize;
-            dst &= dst - 1;
-            self.reg_writer[reg] = self.next_slot;
-        }
-
-        self.next_slot += 1;
-        self.decode_slots = self.decode_slots.saturating_sub(cost.decode_slots);
     }
 
-    /// Drain all in-flight instructions and return max(cycles - 3, 1).
+    /// Simulate the pipeline and return max(cycles - 3, 1).
+    /// Matches gas_sim_traced() behavior exactly.
     pub fn flush_and_get_cost(&mut self) -> u32 {
-        // Flush: keep ticking until pipeline is empty
+        let n = self.count;
+        if n == 0 { return 1; }
+
+        // ROB entries (stack-allocated)
+        let mut state = [State::Fin; MAX_INSTRS];
+        let mut cycles_left = [0u8; MAX_INSTRS];
+        let mut deps = [0u32; MAX_INSTRS]; // bitmask of ROB indices this entry depends on
+        let mut exec_unit = [0u8; MAX_INSTRS];
+        let mut rob_len: usize = 0;
+
+        // Per-register: which ROB entry last wrote it (0xFF = none)
+        let mut reg_writer = [0xFFu8; 16];
+
+        // Simulation state
+        let mut ip: usize = 0; // next instruction to decode (index into self.instrs)
+        let mut decode_slots: u8 = 4;
+        let mut dispatch_slots: u8 = 5;
+        let mut eu_avail: [u8; 5] = [4, 4, 4, 1, 1]; // alu, load, store, mul, div
+        let mut cycles: u32 = 0;
+        let mut ip_done = false; // true when all instructions decoded (or terminator hit)
+
         for _ in 0..100_000u32 {
-            // Try dispatching any ready WAIT entries
-            self.dispatch_all();
-            // Check if done
-            if self.exe_mask == 0 && self.wait_mask == 0 {
-                break;
+            // Priority 1: Decode
+            if !ip_done && ip < n && decode_slots > 0 && rob_len < MAX_INSTRS {
+                let inst = &self.instrs[ip];
+
+                if inst.is_move_reg {
+                    // move_reg: consume decode slots, no ROB entry
+                    decode_slots = decode_slots.saturating_sub(inst.decode_slots);
+                    ip += 1;
+                    if ip >= n { ip_done = true; }
+                    continue;
+                }
+
+                {
+                    // Build dependency mask
+                    let mut dep_mask: u32 = 0;
+                    let mut src = inst.src_mask;
+                    while src != 0 {
+                        let reg = src.trailing_zeros() as usize;
+                        src &= src - 1;
+                        if reg < 16 {
+                            let writer = reg_writer[reg];
+                            if writer != 0xFF && state[writer as usize] != State::Fin {
+                                dep_mask |= 1u32 << writer;
+                            }
+                        }
+                    }
+
+                    // Insert into ROB
+                    let slot = rob_len;
+                    state[slot] = State::Wait;
+                    cycles_left[slot] = inst.cycles;
+                    deps[slot] = dep_mask;
+                    exec_unit[slot] = inst.exec_unit;
+                    rob_len += 1;
+
+                    // Update register writers
+                    let mut dst = inst.dst_mask;
+                    while dst != 0 {
+                        let reg = dst.trailing_zeros() as usize;
+                        dst &= dst - 1;
+                        if reg < 16 {
+                            reg_writer[reg] = slot as u8;
+                        }
+                    }
+
+                    decode_slots = decode_slots.saturating_sub(inst.decode_slots);
+                    ip += 1;
+                    if ip >= n { ip_done = true; }
+                    continue;
+                }
+            }  // end priority 1
+
+            // Priority 2: Dispatch one ready entry
+            let mut dispatched = false;
+            if dispatch_slots > 0 {
+                for i in 0..rob_len {
+                    if state[i] != State::Wait { continue; }
+                    // Check all deps are Fin
+                    let dep = deps[i];
+                    let mut all_fin = true;
+                    let mut d = dep;
+                    while d != 0 {
+                        let j = d.trailing_zeros() as usize;
+                        d &= d - 1;
+                        if state[j] != State::Fin { all_fin = false; break; }
+                    }
+                    if !all_fin { continue; }
+                    // Check EU available
+                    if !eu_available(&eu_avail, exec_unit[i]) { continue; }
+
+                    // Dispatch
+                    eu_consume(&mut eu_avail, exec_unit[i]);
+                    state[i] = State::Exe;
+                    dispatch_slots -= 1;
+                    dispatched = true;
+                    break;
+                }
             }
-            // If there are EXE entries, advance (with fast-forward)
-            if self.exe_mask != 0 {
-                self.tick_fast_forward();
-            } else {
-                // Only WAIT entries remain — need a cycle to dispatch them
-                self.advance_one_cycle();
+            if dispatched { continue; }
+
+            // Priority 3: Check done
+            if ip_done {
+                let mut all_done = true;
+                for i in 0..rob_len {
+                    if state[i] != State::Fin { all_done = false; break; }
+                }
+                if all_done { break; }
             }
+
+            // Priority 4: Advance cycle
+            for i in 0..rob_len {
+                if state[i] == State::Exe {
+                    if cycles_left[i] <= 1 {
+                        state[i] = State::Fin;
+                        cycles_left[i] = 0;
+                    } else {
+                        cycles_left[i] -= 1;
+                    }
+                }
+            }
+            cycles += 1;
+            decode_slots = 4;
+            dispatch_slots = 5;
+            eu_avail = [4, 4, 4, 1, 1];
         }
-        let c = self.cycles;
+
+        let c = cycles;
         if c > 3 { c - 3 } else { 1 }
     }
 
     /// Reset for the next gas block.
     #[inline]
     pub fn reset(&mut self) {
-        self.cycles_left = [0; 32];
-        self.exec_unit = [0; 32];
-        self.deps = [0; 32];
-        self.reg_writer = [0xFF; 16];
-        self.wait_mask = 0;
-        self.exe_mask = 0;
-        self.fin_mask = 0;
-        self.next_slot = 0;
-        self.cycles = 0;
-        self.decode_slots = 4;
-        self.dispatch_slots = 5;
-        self.eu_avail = [4, 4, 4, 1, 1];
-    }
-
-    /// Dispatch as many ready WAIT entries as possible this cycle.
-    #[inline]
-    fn dispatch_all(&mut self) {
-        while self.dispatch_slots > 0 {
-            let mut candidates = self.wait_mask;
-            let mut found = false;
-            while candidates != 0 {
-                let i = candidates.trailing_zeros() as usize;
-                candidates &= candidates - 1;
-                if (self.deps[i] & !self.fin_mask) == 0
-                    && eu_available(&self.eu_avail, self.exec_unit[i])
-                {
-                    eu_consume(&mut self.eu_avail, self.exec_unit[i]);
-                    self.wait_mask &= !(1u32 << i);
-                    self.exe_mask |= 1u32 << i;
-                    self.dispatch_slots -= 1;
-                    found = true;
-                    break;
-                }
-            }
-            if !found { break; }
-        }
-    }
-
-    /// Advance cycles with fast-forward: skip to the next completion event.
-    ///
-    /// Instead of ticking one cycle at a time, compute the minimum cycles_left
-    /// among all EXE entries and subtract that in one step. This turns a
-    /// 25-iteration loop (for a load) into a single operation.
-    #[inline]
-    fn tick_fast_forward(&mut self) {
-        if self.exe_mask == 0 {
-            // Nothing executing — just reset per-cycle state
-            self.advance_one_cycle();
-            return;
-        }
-
-        // Find minimum cycles remaining among executing entries
-        let skip = self.min_exe_cycles();
-        if skip <= 1 {
-            // Normal single-cycle tick
-            self.advance_one_cycle();
-            return;
-        }
-
-        // Fast-forward: subtract (skip - 1) cycles from all EXE entries,
-        // then do one normal tick to handle state transitions.
-        // We subtract (skip - 1) so the final normal tick transitions
-        // the entry to FIN correctly.
-        let bulk = skip - 1;
-        self.cycles += bulk as u32;
-        bulk_decrement_exe(&mut self.cycles_left, self.exe_mask, bulk);
-        // Now do one normal tick cycle
-        self.advance_one_cycle();
-    }
-
-    /// Normal single-cycle advance.
-    #[inline(always)]
-    fn advance_one_cycle(&mut self) {
-        advance_cycle_scalar(&mut self.cycles_left, &mut self.exe_mask, &mut self.fin_mask);
-        self.cycles += 1;
-        self.decode_slots = 4;
-        self.dispatch_slots = 5;
-        self.eu_avail = [4, 4, 4, 1, 1];
-    }
-
-    /// Find minimum cycles_left among EXE entries.
-    #[inline]
-    fn min_exe_cycles(&self) -> u8 {
-        min_exe_cycles_impl(&self.cycles_left, self.exe_mask)
-    }
-}
-
-// ---- Platform-specific implementations ----
-
-/// Scalar: find minimum cycles_left among EXE entries.
-#[inline]
-fn min_exe_cycles_impl(cycles_left: &[u8; 32], exe_mask: u32) -> u8 {
-    let mut min_c = u8::MAX;
-    let mut exe = exe_mask;
-    while exe != 0 {
-        let i = exe.trailing_zeros() as usize;
-        exe &= exe - 1;
-        min_c = min_c.min(cycles_left[i]);
-    }
-    min_c
-}
-
-/// Scalar: subtract `amount` from all EXE entries.
-#[inline]
-fn bulk_decrement_exe(cycles_left: &mut [u8; 32], exe_mask: u32, amount: u8) {
-    let mut exe = exe_mask;
-    while exe != 0 {
-        let i = exe.trailing_zeros() as usize;
-        exe &= exe - 1;
-        cycles_left[i] = cycles_left[i].saturating_sub(amount);
-    }
-}
-
-/// Scalar: advance one cycle — decrement EXE entries, transition FIN.
-#[inline(always)]
-fn advance_cycle_scalar(cycles_left: &mut [u8; 32], exe_mask: &mut u32, fin_mask: &mut u32) {
-    let mut exe = *exe_mask;
-    while exe != 0 {
-        let i = exe.trailing_zeros() as usize;
-        exe &= exe - 1;
-        if cycles_left[i] <= 1 {
-            cycles_left[i] = 0;
-            *exe_mask &= !(1u32 << i);
-            *fin_mask |= 1u32 << i;
-        } else {
-            cycles_left[i] -= 1;
-        }
+        self.count = 0;
     }
 }
 
 #[inline(always)]
 fn eu_available(avail: &[u8; 5], eu: u8) -> bool {
     match eu {
-        EU_NONE => true,
-        EU_ALU => avail[0] >= 1,
-        EU_LOAD => avail[0] >= 1 && avail[1] >= 1,
-        EU_STORE => avail[0] >= 1 && avail[2] >= 1,
-        EU_MUL => avail[0] >= 1 && avail[3] >= 1,
-        EU_DIV => avail[0] >= 1 && avail[4] >= 1,
+        0 => true,       // EU_NONE
+        1 => avail[0] >= 1, // EU_ALU
+        2 => avail[0] >= 1 && avail[1] >= 1, // EU_LOAD (alu + load)
+        3 => avail[0] >= 1 && avail[2] >= 1, // EU_STORE (alu + store)
+        4 => avail[0] >= 1 && avail[3] >= 1, // EU_MUL (alu + mul)
+        5 => avail[0] >= 1 && avail[4] >= 1, // EU_DIV (alu + div)
         _ => false,
     }
 }
@@ -287,11 +214,11 @@ fn eu_available(avail: &[u8; 5], eu: u8) -> bool {
 #[inline(always)]
 fn eu_consume(avail: &mut [u8; 5], eu: u8) {
     match eu {
-        EU_ALU => { avail[0] -= 1; }
-        EU_LOAD => { avail[0] -= 1; avail[1] -= 1; }
-        EU_STORE => { avail[0] -= 1; avail[2] -= 1; }
-        EU_MUL => { avail[0] -= 1; avail[3] -= 1; }
-        EU_DIV => { avail[0] -= 1; avail[4] -= 1; }
+        1 => { avail[0] -= 1; }             // ALU
+        2 => { avail[0] -= 1; avail[1] -= 1; } // LOAD
+        3 => { avail[0] -= 1; avail[2] -= 1; } // STORE
+        4 => { avail[0] -= 1; avail[3] -= 1; } // MUL
+        5 => { avail[0] -= 1; avail[4] -= 1; } // DIV
         _ => {}
     }
 }
