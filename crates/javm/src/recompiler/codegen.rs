@@ -2241,14 +2241,12 @@ impl Compiler {
 
     /// Emit exit sequences and epilogue.
     fn emit_exit_sequences(&mut self) {
-        // Per-gas-block OOG stubs (cold code): restore gas (undo the sub), store PC,
-        // then jump to shared OOG handler. The caller (run()) will fall back to the
-        // interpreter for the remaining instructions in this block.
+        // Per-gas-block OOG stubs: store PC, jump to shared OOG handler.
+        // JAR v0.8.0 pipeline gas: the full block cost is always the correct
+        // charge, so we let the subtraction stand (no gas restore needed).
         let stubs = std::mem::take(&mut self.oog_stubs);
-        for (label, pvm_pc, cost) in &stubs {
+        for (label, pvm_pc, _cost) in &stubs {
             self.asm.bind_label(*label);
-            // Restore gas to pre-subtraction value (add back the block cost)
-            self.asm.add_mem64_imm32(CTX, CTX_GAS, *cost as i32);
             self.asm.mov_store32_imm(CTX, CTX_PC as i32, *pvm_pc as i32);
             self.asm.jmp_label(self.oog_label);
         }

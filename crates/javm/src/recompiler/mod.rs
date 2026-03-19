@@ -840,37 +840,11 @@ impl RecompiledPvm {
 
     #[cold]
     fn handle_oog_exit(&mut self) -> ExitReason {
-        // Block-level OOG: gas was restored to pre-subtraction value.
-        // Fall back to the interpreter for the remaining instructions
-        // in this block, which handles per-instruction OOG correctly.
-        let pc = self.ctx().pc;
-        let remaining_gas = self.ctx().gas as u64;
-        if remaining_gas == 0 {
-            self.ctx_mut().entry_pc = pc;
-            return ExitReason::OutOfGas;
-        }
-        let mut interp = crate::vm::Pvm::new(
-            self.code.clone(),
-            self.bitmask.clone(),
-            self.jump_table.clone(),
-            *self.registers(),
-            self.memory().clone(),
-            remaining_gas,
-        );
-        interp.pc = pc;
-        interp.heap_base = self.ctx().heap_base;
-        interp.heap_top = self.ctx().heap_top;
-        let (exit, _) = interp.run();
-        for i in 0..13 {
-            self.ctx_mut().regs[i] = interp.registers[i];
-        }
-        self.ctx_mut().gas = interp.gas as i64;
-        self.ctx_mut().pc = interp.pc;
-        self.ctx_mut().entry_pc = interp.pc;
-        self.ctx_mut().heap_base = interp.heap_base;
-        self.ctx_mut().heap_top = interp.heap_top;
-        self.sync_memory_from_interp(&interp.memory);
-        exit
+        // JAR v0.8.0 pipeline gas: the full block cost is always the correct
+        // charge. The gas subtraction already happened in the JIT code —
+        // just return OOG. No interpreter fallback needed.
+        self.ctx_mut().entry_pc = self.ctx().pc;
+        ExitReason::OutOfGas
     }
 
     /// Access the PVM registers.
