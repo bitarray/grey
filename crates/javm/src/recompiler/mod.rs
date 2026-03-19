@@ -559,15 +559,19 @@ impl RecompiledPvm {
         let basic_block_starts: Vec<bool> = bitmask.iter().map(|&b| b == 1).collect();
 
         // Fast gas-block bitmap (byte-level scan, no full instruction decoding).
+        let _t0 = std::time::Instant::now();
         let gas_starts = predecode::compute_gas_blocks(&code, &bitmask, &jump_table);
+        let _t_gas_blocks = _t0.elapsed();
 
         // Allocate memory on the heap so we have a stable pointer
         let memory = Box::new(memory);
         let memory_ptr = Box::into_raw(memory);
 
         // Initialize flat memory — JitContext will live inside this region
+        let _t1 = std::time::Instant::now();
         let flat_memory = FlatMemory::new(unsafe { &*memory_ptr })
             .ok_or("failed to mmap flat memory region")?;
+        let _t_flat = _t1.elapsed();
 
         // Place JitContext inside the flat memory region (at buf - CTX_PAGE)
         let ctx_raw = flat_memory.ctx_ptr() as *mut JitContext;
@@ -624,6 +628,7 @@ impl RecompiledPvm {
             sbrk_helper: sbrk_helper as *const () as u64,
         };
 
+        let _t2 = std::time::Instant::now();
         let compiler = Compiler::new(
             basic_block_starts.clone(),
             jump_table.clone(),
@@ -631,6 +636,7 @@ impl RecompiledPvm {
             code.len(),
         );
         let compile_result = compiler.compile(&code, &bitmask, &gas_starts);
+        let _t_compile = _t2.elapsed();
         let native = compile_result.native_code;
         let dispatch_table = compile_result.dispatch_table;
 
@@ -643,7 +649,9 @@ impl RecompiledPvm {
             );
         }
 
+        let _t3 = std::time::Instant::now();
         let native_code = NativeCode::new(&native)?;
+        let _t_native = _t3.elapsed();
 
         // Signal-based bounds checking: build trap table and install guard pages.
         #[cfg(feature = "signals")]
@@ -660,6 +668,16 @@ impl RecompiledPvm {
             // after heap_top is set to its correct value.
             Some(ss)
         };
+
+        tracing::debug!(
+            gas_blocks_us = _t_gas_blocks.as_micros() as u64,
+            flat_mem_us = _t_flat.as_micros() as u64,
+            compile_us = _t_compile.as_micros() as u64,
+            native_us = _t_native.as_micros() as u64,
+            code_len = code.len(),
+            native_len = native.len(),
+            "recompiler::new() timing"
+        );
 
         // Set dispatch table pointer and code base in context
         ctx.code_base = native_code.ptr as u64;
@@ -1033,7 +1051,6 @@ pub fn initialize_program_recompiled(
     arguments: &[u8],
     gas: Gas,
 ) -> Option<RecompiledPvm> {
-    // Lightweight parse: skip Pvm::new() predecoding (saves ~140ms for large programs).
     let parsed = crate::program::parse_program_blob(blob, arguments, gas)?;
 
     let mut rpvm = RecompiledPvm::new(
