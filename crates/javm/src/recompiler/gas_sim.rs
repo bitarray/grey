@@ -69,8 +69,8 @@ impl GasSimulator {
         let mut exec_unit = [0u8; MAX_INSTRS];
         let mut rob_len: usize = 0;
 
-        // Per-register: which ROB entry last wrote it (0xFF = none)
-        let mut reg_writer = [0xFFu8; 16];
+        // Per-register: bitmask of ROB entries that wrote it and haven't finished yet
+        let mut reg_writers = [0u32; 16];
 
         // Simulation state
         let mut ip: usize = 0; // next instruction to decode (index into self.instrs)
@@ -94,16 +94,21 @@ impl GasSimulator {
                 }
 
                 {
-                    // Build dependency mask
+                    // Build dependency mask: depend on ALL non-Fin writers of source regs
                     let mut dep_mask: u32 = 0;
                     let mut src = inst.src_mask;
                     while src != 0 {
                         let reg = src.trailing_zeros() as usize;
                         src &= src - 1;
                         if reg < 16 {
-                            let writer = reg_writer[reg];
-                            if writer != 0xFF && state[writer as usize] != State::Fin {
-                                dep_mask |= 1u32 << writer;
+                            // Add all non-Fin writers of this register
+                            let mut writers = reg_writers[reg];
+                            while writers != 0 {
+                                let w = writers.trailing_zeros() as usize;
+                                writers &= writers - 1;
+                                if state[w] != State::Fin {
+                                    dep_mask |= 1u32 << w;
+                                }
                             }
                         }
                     }
@@ -116,13 +121,13 @@ impl GasSimulator {
                     exec_unit[slot] = inst.exec_unit;
                     rob_len += 1;
 
-                    // Update register writers
+                    // Update register writers (add this slot to writer set)
                     let mut dst = inst.dst_mask;
                     while dst != 0 {
                         let reg = dst.trailing_zeros() as usize;
                         dst &= dst - 1;
                         if reg < 16 {
-                            reg_writer[reg] = slot as u8;
+                            reg_writers[reg] |= 1u32 << slot;
                         }
                     }
 
